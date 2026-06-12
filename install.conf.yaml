@@ -16,6 +16,18 @@
       path: config/claude/commands
     ~/.claude/CLAUDE.md:
       # force: this replaces a pre-existing real CLAUDE.md (the repo is the
-      # source of truth for it; the personal Spokenly rule lives in-file).
+      # source of truth for it).
       path: config/claude/CLAUDE.md
       force: true
+    ~/.claude/settings.json:
+      # User-global Claude Code config (not runtime state) — owns the TTS Stop
+      # hook registration, so the on-demand voice toggle restores on a fresh
+      # machine. force: replaces the pre-existing real file.
+      path: config/claude/settings.json
+      force: true
+    # Individual hook scripts only — the flag file (tts-enabled) and the
+    # fired log are runtime state that stay as real files in ~/.claude/hooks.
+    ~/.claude/hooks/tts-stop-hook.sh:
+      path: config/claude/hooks/tts-stop-hook.sh
+    ~/.claude/hooks/tts-toggle.sh:
+      path: config/claude/hooks/tts-toggle.sh
