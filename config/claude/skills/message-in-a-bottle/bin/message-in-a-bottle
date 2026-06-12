@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# message-in-a-bottle — schedule a delayed self-message into the current
+# tmux pane. The launcher returns immediately; a detached worker resets the
+# context (/clear or /compact) and pastes the message after a fixed delay.
+#
+# Modes:
+#   launcher:  message-in-a-bottle [message...]
+#   worker:    message-in-a-bottle --worker <target> <reset> <msgfile>
+#
+# Reset is inferred from the message: if /compact appears within the first
+# 3 sentences, compact is used; otherwise clear.
+
+set -euo pipefail
+
+# [LAW:one-source-of-truth] timing lives here once. BOTTLE_DELAY_SECONDS is how
+# long to wait before firing; SETTLE_SECONDS is how long to let the reset render
+# before reading the pane back to verify it ran.
+BOTTLE_DELAY_SECONDS=10
+SETTLE_SECONDS=5
+
+# [LAW:one-source-of-truth] the static framing wrapped around the agent's message
+# lives here once. The launcher composes PREFIX + agent message + SUFFIX into the
+# single value that flows to the pane; the worker stays a dumb conduit. Edit the
+# placeholder text between the markers — leave the surrounding heredoc mechanics.
+BOTTLE_PREFIX=$(cat <<'PREFIX'
+=== Below is a message from an agent on behalf of the user ===
+PREFIX
+)
+BOTTLE_SUFFIX=$(cat <<'SUFFIX'
+=== The above message was sent on behalf of the user, but as it was sent from an agent, double checking the claims is wise.  When in doubt, note any divergence and run the '/next' skill to proceed.  Do NOT ask the user if you should run '/next'. ===
+SUFFIX
+)
+
+# [LAW:dataflow-not-control-flow] reset mode is a value inferred from the
+# message, not a separate argument. Scan the first 3 sentences for /compact;
+# stop early so long messages don't slow the common case.
+_first_three_sentences() {
+  local text="$1" result="" count=0 i char
+  for ((i=0; i<${#text}; i++)); do
+    char="${text:$i:1}"
+    result+="$char"
+    if [[ "$char" == "." || "$char" == "!" || "$char" == "?" ]]; then
+      ((count++)) || true
+      [[ $count -ge 3 ]] && break
+    fi
+  done
+  printf '%s' "$result"
+}
+
+# [LAW:types-are-the-program] one discriminator at the entry; everything
+# downstream operates on validated, typed inputs for exactly one mode.
+if [[ "${1:-}" == "--worker" ]]; then
+  MODE=worker
+  shift
+else
+  MODE=launcher
+fi
+
+case "$MODE" in
+
+  launcher)
+    # [LAW:dataflow-not-control-flow] the message is a value carrying a canonical
+    # default — /next, the standard "pull the next ticket" handoff. Omitting argv
+    # selects that default; it never yields an empty bottle, so no guard follows.
+    AGENT_MESSAGE="${*:-/next}"
+
+    # [LAW:dataflow-not-control-flow] reset mode is derived from the message — if
+    # /compact appears in the first 3 sentences, use compact; else clear. The mode
+    # is a value the message carries, not a separate argument the caller decides.
+    PROBE=$(_first_three_sentences "$AGENT_MESSAGE")
+    if [[ "$PROBE" =~ (^|[[:space:]])/compact([[:space:]]|$) ]]; then
+      RESET=compact
+    else
+      RESET=clear
+    fi
+
+    # [LAW:one-source-of-truth] the wrapped value is assembled once, here, from the
+    # static framing and the agent's message. Everything downstream — MSGFILE,
+    # buffer, paste — carries this final value verbatim and never re-wraps it.
+    MESSAGE=$(printf '%s\n%s\n%s' "$BOTTLE_PREFIX" "$AGENT_MESSAGE" "$BOTTLE_SUFFIX")
+
+    # [LAW:no-defensive-null-guards] the tmux context is a real trust boundary —
+    # fail loudly when it's absent. The message needs no such guard: it carries a
+    # canonical default and is non-empty by construction.
+    [[ -n "${TMUX:-}" && -n "${TMUX_PANE:-}" ]] \
+      || { echo "not inside tmux (\$TMUX/\$TMUX_PANE unset)" >&2; exit 2; }
+
+    # [LAW:one-source-of-truth] target derived from $TMUX_PANE via tmux
+    # itself — never accepted as a flag; tmux is the authority.
+    TARGET=$(tmux display-message -p -t "$TMUX_PANE" \
+      '#{session_name}:#{window_index}.#{pane_index}')
+
+    # [LAW:dataflow-not-control-flow] the message flows through a tempfile
+    # as a value, bypassing every shell-quoting hazard between argv → worker
+    # → tmux load-buffer. No escaping branches anywhere.
+    MSGFILE=$(mktemp -t bottle-msg.XXXXXX)
+    LOGFILE=""
+    # [LAW:single-enforcer] one trap covers both tempfiles until the worker
+    # is spawned; cleared right after `nohup` so the worker owns MSGFILE and
+    # the launcher's "log: ..." line is the only reference to LOGFILE.
+    # ${LOGFILE:+...} elides the arg entirely while LOGFILE is still empty —
+    # avoids passing "" to rm, which GNU coreutils warns about.
+    trap 'rm -f -- "$MSGFILE" ${LOGFILE:+"$LOGFILE"}' EXIT
+    printf '%s' "$MESSAGE" > "$MSGFILE"
+
+    # Resolve own path for both ./script and PATH-lookup invocations.
+    # `$0` lacks a slash on PATH lookup, so dirname/pwd would yield $PWD
+    # — wrong. `command -v` does PATH resolution; for paths containing
+    # slashes it returns as-is.
+    if [[ "$0" == */* ]]; then
+      SELF_RAW="$0"
+    else
+      SELF_RAW=$(command -v -- "$0") \
+        || { echo "cannot resolve own path from \$0=$0" >&2; exit 2; }
+    fi
+    SELF="$(cd "$(dirname "$SELF_RAW")" && pwd)/$(basename "$SELF_RAW")"
+
+    # LOGFILE created just before the spawn — short lifetime minimizes the
+    # window where a signal or freak `>>` failure could leave it behind,
+    # and the EXIT trap above covers it as a backstop until we clear it.
+    LOGFILE=$(mktemp -t bottle-log.XXXXXX)
+
+    # nohup ignores SIGHUP, redirected stdio keeps nohup.out from spawning,
+    # and the backgrounded child gets reparented to init when this shell
+    # exits — `disown` would be belt-and-suspenders, but with `set -e` a
+    # disown failure would fire the trap and yank MSGFILE out from under
+    # the running worker. Leaving disown out closes that race entirely.
+    nohup "$SELF" --worker "$TARGET" "$RESET" "$MSGFILE" \
+      </dev/null >>"$LOGFILE" 2>&1 &
+    trap - EXIT
+
+    echo "bottle scheduled → $TARGET (/$RESET) in ${BOTTLE_DELAY_SECONDS}s (log: $LOGFILE)"
+    ;;
+
+  worker)
+    if [[ $# -ne 3 ]]; then
+      echo "internal error: worker expects exactly 3 args" >&2
+      exit 2
+    fi
+    TARGET="$1"
+    RESET="$2"
+    MSGFILE="$3"
+
+    # [LAW:single-enforcer] launcher owns input validation (RESET value,
+    # MSGFILE existence) AND log destination (via nohup stdout redirect).
+    # `--worker` is a non-interface, not a public entry point, so the worker
+    # does not re-check — duplicating those checks would be drift-prone
+    # ceremony for states that cannot occur via the documented call path.
+    BUFFER="bottle-$$"
+
+    # [LAW:single-enforcer] the trap owns only the message file; the paste
+    # buffer deletes itself on paste (paste-buffer -d).
+    trap 'rm -f "$MSGFILE"' EXIT
+
+    log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
+
+    # A reset that actually RAN leaves an app-generated marker on the visible
+    # screen that the echoed/queued command text never reproduces — so finding
+    # it can't be fooled by a reset that was swallowed as literal text.
+    case "$RESET" in
+      clear)   REGISTERED_RE='Claude Code v[0-9]' ;;
+      compact) REGISTERED_RE='Compacting conversation|Conversation compacted' ;;
+    esac
+
+    log "waking; target=$TARGET reset=/$RESET"
+    sleep "$BOTTLE_DELAY_SECONDS"
+
+    # [LAW:dataflow-not-control-flow] Escape cancels whatever was running — we
+    # never inspect what; cancelling is the point. Then submit the reset onto
+    # the now-ready prompt and let it render.
+    tmux send-keys -t "$TARGET" Escape
+    sleep 1
+    tmux send-keys -t "$TARGET" "/$RESET"
+    sleep 0.5
+    tmux send-keys -t "$TARGET" Enter
+    sleep "$SETTLE_SECONDS"
+
+    # [LAW:types-are-the-program] the message paste is reachable only after the
+    # reset is verified to have run — it cannot land in an un-reset session. No
+    # marker, no message: surface the misfire in the intact session instead.
+    if tmux capture-pane -t "$TARGET" -p | grep -qE "$REGISTERED_RE"; then
+      log "/$RESET registered; sending message"
+      tmux load-buffer -b "$BUFFER" "$MSGFILE"
+      tmux paste-buffer -d -b "$BUFFER" -t "$TARGET" -p
+      sleep 0.5
+      tmux send-keys -t "$TARGET" Enter
+    else
+      log "MISFIRE: /$RESET did not register; message NOT sent"
+      # The session was never reset, so it has a live agent — send it a fixed
+      # note it will surface to the user, rather than silently dropping the
+      # handoff. A fixed string, so send-keys -l carries it directly.
+      tmux send-keys -t "$TARGET" -l "message-in-a-bottle misfired: the scheduled /$RESET never registered, so the queued handoff was NOT sent. Please tell the user the bottle misfired."
+      sleep 0.5
+      tmux send-keys -t "$TARGET" Enter
+    fi
+    ;;
+esac

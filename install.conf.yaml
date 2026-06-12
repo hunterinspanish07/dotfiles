@@ -1,0 +1,21 @@
+- defaults:
+    link:
+      create: true   # create parent dirs (e.g. ~/.claude) as needed
+      relink: true   # replace an existing symlink that points elsewhere
+
+# ~/.claude holds Claude Code runtime state (sessions, projects, plugins, the
+# machine-local settings.local.json). We never link the whole directory — only
+# the specific config we own, so runtime state is left untouched.
+- create:
+    - ~/.claude
+
+- link:
+    ~/.claude/skills:
+      path: config/claude/skills
+    ~/.claude/commands:
+      path: config/claude/commands
+    ~/.claude/CLAUDE.md:
+      # force: this replaces a pre-existing real CLAUDE.md (the repo is the
+      # source of truth for it; the personal Spokenly rule lives in-file).
+      path: config/claude/CLAUDE.md
+      force: true

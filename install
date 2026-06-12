@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# install — symlink this repo's config into place via dotbot.
+# dotbot is pulled on demand by uvx (no submodule, no global install).
+set -euo pipefail
+
+BASEDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${BASEDIR}"
+
+if ! command -v uvx >/dev/null 2>&1; then
+  echo "error: uvx (from uv) is required. Install it: brew install uv" >&2
+  exit 1
+fi
+
+exec uvx dotbot -d "${BASEDIR}" -c install.conf.yaml "$@"
