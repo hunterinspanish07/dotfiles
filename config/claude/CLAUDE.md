@@ -1,9 +1,3 @@
-<personal>
-# PERSONAL — Hunter
-
-- **When you do ask the user a question, ALWAYS ask it through `mcp__spokenly__ask_user_dictation`** (load it via ToolSearch if it isn't already available), never as plain text. I answer by voice via Spokenly. This governs *how* to ask — it does not loosen `<decision-autonomy>` below, which governs *whether* to ask: resolve what an expert would resolve; surface only the genuinely user-owned decision, with your recommendation first, and surface it through Spokenly.
-</personal>
-
 <universal-laws>
 # UNIVERSAL LAWS
 
