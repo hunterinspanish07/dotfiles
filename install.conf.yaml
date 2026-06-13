@@ -31,6 +31,15 @@
       path: config/claude/hooks/tts-stop-hook.sh
     ~/.claude/hooks/tts-toggle.sh:
       path: config/claude/hooks/tts-toggle.sh
+    # Background worker (summarize -> synthesize -> play), driven by the Stop hook.
+    ~/.claude/hooks/tts-speak.sh:
+      path: config/claude/hooks/tts-speak.sh
+    # Kill button: silence the current reply without disabling TTS.
+    ~/.claude/hooks/tts-silence.sh:
+      path: config/claude/hooks/tts-silence.sh
+    # skhd global hotkey (⌃⌥X) that fires the TTS kill button.
+    ~/.config/skhd/skhdrc:
+      path: config/skhd/skhdrc
     # litmux — one-command clean tmux session for the current repo. Lands in
     # ~/go/bin, which is already on PATH (via ~/.zshenv, where `lit` lives too),
     # so no shell-config change is needed. Relocate if you keep tools elsewhere.

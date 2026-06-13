@@ -1,0 +1,8 @@
+# skhd — global hotkeys.
+#
+# Silence the current TTS reply WITHOUT disabling text-to-speech, so one keypress
+# stops a reply you don't want to hear without leaving you muted. Pairs with
+# tts-silence.sh (managed in this repo, symlinked into ~/.claude/hooks).
+#
+# ⌃⌥X  ->  stop current playback / synthesis / worker
+ctrl + alt - x : /Users/hhouse/.claude/hooks/tts-silence.sh
