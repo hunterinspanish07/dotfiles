@@ -187,6 +187,6 @@ Concurrent agents must never share one working tree or HEAD — that is exactly 
 5. Do the work **in the worktree** — never directly on the integration branch.
 6. On longer tasks, `git fetch origin && git rebase "origin/$BASE"` once or twice a day to stay current.
 7. Commit the finished work as its own commit — required, every time. Leave the tree clean.
-8. Open a PR **targeting `$BASE`** — never push directly to the integration branch — and in the same response invoke `/address-pr-reviews` on it. Starting the review loop is part of opening the PR, not a separate step the user triggers. Every PR, every project, unconditionally. The review loop's Finalize refreshes onto the live base, merges, and removes the worktree.
+8. Open a PR **targeting `$BASE`** — never push directly to the integration branch — and in the same response invoke `/address-pr-reviews` on it. Starting the review loop is part of opening the PR, not a separate step the user triggers. Every PR, every project, unconditionally. The review loop's Finalize then takes the PR to its terminal — and **merge is human-gated by DEFAULT**: with no active autonomy grant, Finalize refreshes onto the live base, drives the PR to green-and-reviewed, and STOPS there for the human to merge. An explicit `/auto` grant is the *only* thing that authorizes the agent to merge, remove the worktree, and chain the next eligible ticket — see `/auto` (writes the grant) and `address-pr-reviews` Finalize (`StopForHumanMerge | MergeAndChain`, selected by the grant).
 </git-workflow>
 </operations>

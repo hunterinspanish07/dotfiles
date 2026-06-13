@@ -147,11 +147,45 @@ Pushing triggers re-review for providers that auto-fire on push (`trigger: False
 
 ## Finalize — when the loop exits clean
 
-The loop exits with zero unresolved findings after a clean re-review. The PR is reviewed; the work is done. [LAW:single-enforcer] this skill is the single place that closes a PR loop — merge, ticket-close, and recap live here, not scattered across callers or punted to the user. [LAW:dataflow-not-control-flow] finalize runs unconditionally on every clean exit; the data (the PR, the in-progress ticket, the merged commits) is what each step operates on. Per `<ticket-lifecycle>`, the agent owns ticket close-out — Finalize is where that happens. The recap step is the durable handoff to the next agent (its own justification, not something `<ticket-lifecycle>` requires).
+The loop exits with zero unresolved findings after a clean re-review — the PR is green and reviewed. What happens next is **not** unconditional: it is one of two typed terminal arms, and the discriminator is the **autonomy grant**, never the agent's read of the room.
+
+[LAW:types-are-the-program] `Finalize = StopForHumanMerge | MergeAndChain`. [LAW:dataflow-not-control-flow] the arm is selected by a fact on disk — does an active grant authorize *this* ticket — not by whether the user seems present, whether merging feels bold, or whether stopping feels safer. [LAW:single-enforcer] that fact comes from the one grant authority (`~/.claude/skills/lib/autonomy-grant.py`); this skill never reimplements the rule or mints a second authorization signal. Per `<ticket-lifecycle>` the agent still owns its close-out — but "close-out" means *driving the PR to the terminal state the grant authorizes*, which by default is "green, reviewed, ready for the human to merge."
+
+### Select the arm
+
+Identify the ticket this PR closes (`$TICKET_ID` — from the PR body, branch name, or the ticket worked this session), then ask the single grant authority whether autonomy is authorized for it:
+
+```bash
+TICKET_ID=...   # the ticket this PR closes
+if ~/.claude/skills/lib/autonomy-grant.py authorized "$TICKET_ID"; then
+  ARM=MergeAndChain          # Hunter granted bounded autonomy for this ticket
+else
+  ARM=StopForHumanMerge      # the default — no grant, ticket not in scope, or already done
+fi
+```
+
+A nonzero exit — no grant file, ticket outside the grant's frozen scope, ticket already completed, or *any* error reading the grant — selects **StopForHumanMerge**. That is the safe direction: absent positive authorization, the human merges, never the agent.
+
+**StopForHumanMerge is a legitimate terminal arm, not a "skip."** The earlier framing — that no "skip/ask/hold" arm exists and the agent always merges-and-chains — is replaced: the grant, a value on disk, now selects between two *prescribed* terminals. What remains forbidden is overriding the arm the grant selects for reasons of mood or presence — merging when no grant authorizes it, or stopping when one does, because the user seemed around or the `/clear` felt disruptive. "Presence is irrelevant" still holds: presence was never the discriminator and is not now — the grant is. Execute the arm it selects, as written.
+
+### Arm — StopForHumanMerge (default)
+
+The review loop already did the work: the PR is green and reviewed. Nothing remains but to hand it to Hunter. Report, in this turn:
+
+```
+PR #<num> — <one-line description> — green & reviewed, ready for your merge.
+<anything Hunter should know before merging: a competing open PR that overlaps this one's files, a follow-up this surfaced>
+```
+
+Then **STOP**. Do NOT merge, do NOT `lit done` (the ticket is not merged — its open status correctly mirrors that), do NOT recap-as-merged, do NOT fire a bottle, do NOT remove the worktree (Hunter may want changes). To let the agent merge and chain instead, Hunter authorizes a pool with `/auto`.
+
+### Arm — MergeAndChain (an active grant covers this ticket)
+
+Hunter has granted bounded autonomy for this ticket. Run the close-out — merge, close, recap — then chain the next eligible ticket in the grant's pool.
 
 [LAW:one-source-of-truth] **follow the tooling's runtime guidance.** Each step's tool (`gh pr merge`, `lit done`, `/recap`) emits its own instructions at runtime — preview tokens, next-step hints, branch-protection messages, admin-bypass prompts, apply-token strings, output paths. The skill describes the *shape* of each step; the tool itself is the authoritative source for *how* to follow through. Read what the tool prints and do what it says — don't paper over a warning, don't guess past a prompt, don't substitute the skill's wording when the tool gave you a literal token or path to use.
 
-### A. Refresh onto the live integration branch, then merge
+#### A. Refresh onto the live integration branch, then merge
 
 Before merging, rebase onto what the integration branch *actually is right now* — another session or PR may have merged into it while this loop ran. [LAW:no-silent-failure] a stale base is the "staging moved mid-session" hazard; resolve it here, never merge blind over it. The base is detected, never assumed (`main` is often not the merge target — it may be `staging`/`dev`):
 
@@ -173,6 +207,14 @@ gh pr merge "$PR_URL" --squash --delete-branch
 
 Squash is the repo's configured merge strategy. `--delete-branch` cleans up the remote branch (and the local one if checked out). [LAW:one-source-of-truth] `gh pr merge`'s exit code is the canonical signal of merge success — failure (required checks not satisfied, merge conflict, branch protection) halts Finalize. Don't add a `gh pr view --json merged` check as a second source; the exit code is the truth. At that point the agent's job changes from "close out" to "fix the merge blocker."
 
+[LAW:no-silent-failure] in MergeAndChain a merge blocker — or a rebase conflict you cannot resolve confidently (see the **Conflict** bullet above) — halts the *chain*, not just this ticket. Retire the grant and report what shipped, what's left, and why it stopped:
+
+```bash
+~/.claude/skills/lib/autonomy-grant.py stop
+```
+
+The chain stops on the first failure or blocker by design; it never skips a stuck ticket to keep going.
+
 Once the merge succeeds, retire this ticket's worktree. You are *inside* it, so step out to the main checkout first — a stale worktree pins a now-deleted branch and clutters the next session:
 
 ```bash
@@ -183,7 +225,7 @@ git worktree remove "$MAIN/.claude/worktrees/$TICKET_ID" --force
 
 (If this ticket was worked in an old-style in-place branch rather than a worktree, there is nothing to remove — skip it. Any leftover local branch cleanup follows `gh`'s own runtime guidance.)
 
-### B. Close the lit ticket
+#### B. Close the lit ticket
 
 ```bash
 lit done "$TICKET_ID"
@@ -191,66 +233,55 @@ lit done "$TICKET_ID"
 
 The ticket is the one this PR closed — pull it from the PR body, branch name, or the ticket you were working on in this session, and assign it to `$TICKET_ID`. The code block above is the canonical case: a confidently identified `$TICKET_ID`. Don't run `lit done` with an empty, guessed, or unverified value. `lit done` is a two-phase transition: the first call prints a preview with an apply token; capture it as `$TOKEN` and rerun with `--apply="$TOKEN"` to commit. For an out-of-band PR with no associated lit ticket, Step B is a no-op — skip the command entirely and note the missing-ticket case in the recap so the next agent sees it.
 
-### C. Recap the merged work
+#### C. Recap the merged work
 
 Invoke `/recap` with a short note describing what was merged. The recap is the durable historical record — what shipped, what's left, what to watch out for. It lives in the project's recap log; future sessions browsing history read it there.
 
-### D. Hand off the next session via message-in-a-bottle
+#### D. Chain the next eligible ticket
 
-The handoff has two terminal forms: fire the bottle (with content shaped by the candidate's classified state) or halt and surface a per-candidate failure table to the user. [LAW:types-are-the-program] the section's output is `Handoff = Bottle(direct_work) | Bottle(define_task) | HaltAndExplain(failure_table)` — variants of one typed value, dispatched mechanically from the classification step. Well-definedness is *not* a fire/no-fire gate; it shapes bottle content. The only halt case is project-level misalignment across every examined candidate.
+The grant already froze a human-vetted pool, so there is no candidate re-classification to do here — [LAW:single-enforcer] eligibility and risk were judged once, at grant time in `/auto`. This step only advances the chain.
 
-**These three arms are exhaustive — no "skip," "hold," or "ask instead" arm exists.** The user being present, the step feeling minor, or the `/clear` being disruptive are NOT inputs to this decision. Deviating requires citing a clause *in this skill*; a tool's tone or purpose is never authorization (`message-in-a-bottle`'s "without involving the user" means *requires no user action*, not *only fire when the user is absent*). Absent such a clause the prescribed arm **executes as written** — never a silent skip, never a fallback to asking.
-
-**Step 1 — Enumerate candidates.** Read multiple candidates in priority order:
-
-1. An explicit instruction the user gave during this session for what comes next.
-2. A concrete follow-up this PR surfaced and you queued as a ticket.
-3. The top entries of `lit ready` — pull at least the top three with `lit show <id>` (or all of them if fewer exist).
-
-A pool is needed because the highest-priority slot may hold work that no longer fits where the project actually is after this PR's epic shipped. The next-best aligned candidate is what the next session should actually start on.
-
-**Step 2 — Classify each candidate.** Each candidate sits in exactly one state:
-
-- **AlignedAndDefined** — aligned with the project's current trajectory AND a fresh session could start without asking the user clarifying questions (acceptance criteria explicit, scope bounded, dependencies met).
-- **AlignedButFuzzy** — aligned with the project's current trajectory BUT exploratory or probe-shaped ("explore X", "consider Y", "investigate Z"); the body of work is to *define* the actual work, not to start it.
-- **Misaligned** — the candidate's premise no longer matches the project's actual requirements. Common after an epic ships: the queued item assumed an older architecture, depends on a hypothesis the recent work invalidated, expands surface area the user has decided to contract, or opens a strategic thread the user has not validated at the project level.
-
-**What "aligned" means here — project-level, not session-level.** It asks: does this candidate continue the trajectory the project is actually on right now? After an epic ships, work queued before it may need rescoping, re-prioritization, or outright deletion to fit the project's new shape. That's a strategy call the agent cannot make for the user — when no candidate is aligned, the user must intervene before any handoff is meaningful. (Distinct from the prior framing, which read "aligned" as session-level user assent. That predicate was both too narrow — rejecting valid work the user just hadn't blessed by name — and too loose — admitting tickets that became architecturally stale when the prior epic shipped.)
-
-**Step 3 — Dispatch.** Take the highest-priority candidate classified as Aligned (Defined or Fuzzy). Its state shapes the bottle's content:
-
-- **AlignedAndDefined** → bottle the direct work. The next instruction is a precise pointer (ticket ID, acceptance criteria, or `/next` when the candidate is the top of `lit ready`).
-- **AlignedButFuzzy** → bottle a define-task. The next session (1) understands the problem the candidate raises, (2) investigates possible solutions, and (3) prepares a proposal for the user that surfaces the important information quickly without burying them in irrelevant detail. Implementation waits on user approval of direction.
-
-Empty aligned-pool (every examined candidate classified Misaligned, or no candidates exist at all) → **HaltAndExplain**. Do not fire a bottle. Surface to the user, in this turn, a per-candidate failure table — the candidate's title/ID and the precise reason it failed (what shipped, what direction the project moved, what the candidate assumed that no longer holds). Vague summaries are unacceptable; the user needs the specifics to rescope, reorder, or close the tickets.
-
-**Step 4 — Fire the bottle** (AlignedAndDefined and AlignedButFuzzy arms):
+First record that this ticket merged, so the grant's pending set shrinks:
 
 ```bash
-~/.claude/skills/message-in-a-bottle/bin/message-in-a-bottle 15 "$(cat <<'EOF'
-Last session shipped PR #<num> — <one-line description of what merged>.
-<forward-looking notes the next agent should know: in-flight context,
-follow-ups this PR surfaced, things to watch out for>
+~/.claude/skills/lib/autonomy-grant.py complete "$TICKET_ID"
+```
 
-<next instruction — for AlignedAndDefined: a precise pointer (ticket ID,
-acceptance criteria) or /next. For AlignedButFuzzy: "Understand the
-problem in <ticket>, investigate possible solutions, and prepare a
-proposal for the user that surfaces the important information quickly
-without burying them in irrelevant detail. Return with the proposal —
-do not implement until the user approves direction.">
+Then ask the grant authority what remains, and let the answer pick the terminal:
+
+```bash
+PENDING=$(~/.claude/skills/lib/autonomy-grant.py pending)
+```
+
+[LAW:dataflow-not-control-flow] the value of `PENDING` selects the terminal; neither branch is a judgment call.
+
+- **Pool drained** (`PENDING` empty) → the grant is fulfilled. Retire it, then report — what shipped across the chain, that nothing eligible remains, and any **open** tickets created *after* the grant (never in scope, so NOT auto-run; name them so Hunter can decide). Do **not** fire a bottle; there is nothing authorized left to pick up. Stop here.
+
+  ```bash
+  ~/.claude/skills/lib/autonomy-grant.py stop
+  ```
+
+- **Pool has more** (`PENDING` non-empty) → hand the next ticket to a fresh context. The bottle `/clear`s the pane and pastes `/next`; with the grant still active, that `/next` scopes itself to the eligible set (see the `next` skill), so the chain never wanders outside the authorized pool.
+
+  ```bash
+  ~/.claude/skills/message-in-a-bottle/bin/message-in-a-bottle "$(cat <<'EOF'
+Last session shipped PR #<num> — <one-line description of what merged>.
+An autonomy grant is active and the eligible pool still has tickets. Forward
+notes the next agent should know: <in-flight context, follow-ups this PR
+surfaced, things to watch out for>.
+
+/next
 EOF
 )"
 ```
 
-[LAW:dataflow-not-control-flow] the variability lives in the candidates' classified state, not in whether the agent decided to look or fire. Bottle content (direct vs define-task) and the halt-vs-fire decision are both mechanical consequences of classification — the data picks the variant. Well-definedness in particular is no longer a fire/no-fire gate; it's a content discriminator.
+  [LAW:one-source-of-truth] the bottle's content derives from the same authored recap as step C — past-tense canonical form vs forward-looking handoff, one substrate for two purposes. The bottle script needs tmux and fails loudly outside it; it takes **only** the message — its delay is fixed internally, so never pass a leading number (it has no delay parameter and would fold the number into the message body).
 
-[LAW:one-source-of-truth] when a bottle fires, its content derives from the same authored recap as step C — past-tense canonical form vs forward-looking action, one substrate consumed for two purposes. The bottle script's tmux precondition fails loudly outside tmux — the handoff is meaningless there.
-
-Then stop. The loop is finished, the work is shipped, the recap is filed.
+Then stop. This ticket is shipped and recorded; either the chain continues in a fresh context or the grant is retired and reported.
 
 ## Rules
 
-- **You own the close-out.** When the loop exits clean, run Finalize (merge, close lit ticket, recap). Don't punt these to the user — `<ticket-lifecycle>` is explicit that the agent closes its own tickets, and a PR that sits open waiting for a human to push the merge button is the same anti-pattern. The bottle handoff (step D) fires whenever an aligned candidate exists in the pool; its content (direct work vs define-task) is shaped by whether the candidate is well-defined. The only halt case is project-level misalignment across every examined candidate — alignment is a strategy question the agent cannot answer on the user's behalf, and that case is surfaced as a per-candidate failure table for the user to act on.
+- **You own the close-out — to the terminal the grant authorizes.** When the loop exits clean, run Finalize; the grant selects the terminal. With **no active grant** (the default), drive the PR to green-and-reviewed and STOP at "ready for your merge" — that is the authorized close-out, *not* a punt, because merge authority is human-gated by default. With **an active grant covering the ticket**, merge, close the lit ticket, recap, and chain the next eligible ticket via the bottle — and retire the grant when the pool drains or any ticket fails. What is still forbidden: leaving a PR half-reviewed, or overriding the grant's choice because the user seemed present. Eligibility and risk are judged once, at grant time in `/auto`; Finalize only executes the arm the grant selects.
 - **Architectural laws override reviewer authority.** Refuse suggestions that violate `[LAW:...]`. Cite the law in the pushback reply on the thread — that text is the durable record of why the code is the way it is.
 - **Resolve every finding you addressed, including pushbacks — through `provider.resolve(thread_id)`, and only advance once it confirms.** The reviewer doesn't reply; your comment is the record. Open findings accumulate forever. Resolution is the step that gets silently dropped, which is why it runs through the provider's verified path, not a raw mutation.
 - **Conflicts between findings** — surface to the user before acting. Don't pick a side silently.

@@ -50,6 +50,15 @@ We'll proceed with pulling from the backlog, but Open PRs are still relevant - y
 
 Lit ready shows an overview of the epics and the top ticket in each epic, as well as any in-progress or orphaned tickets.
 
+**If an autonomy grant is active, scope the pool first.** Before choosing anything, ask the single grant authority — read-only here; `/auto` and `address-pr-reviews` own the grant's lifecycle, `next` only reads it:
+
+```bash
+~/.claude/skills/lib/autonomy-grant.py status      # is autonomy authorized in this workspace?
+~/.claude/skills/lib/autonomy-grant.py pending     # if so, the exact eligible ticket ids
+```
+
+When a grant is active, your candidate set is exactly its `pending` tickets intersected with what `lit ready` shows as actually workable — [LAW:single-enforcer] the grant is the one authority for what autonomy may touch, so a bottle's `/next` can never wander outside the authorized pool. Choose within that scoped set using the normal ordering below (orphaned first, then top of ready). If the scoped set is empty — every pending ticket is blocked, or the pool has drained — STOP and report what is pending-but-blocked; do NOT fall back to an unauthorized ticket. (A ticket id you were explicitly handed overrides this scoping — a human naming a ticket is a human decision, not autonomous picking.)
+
 If there are any orphaned tickets, pull from those first.  Those tickets are abandoned and need someone to finish them.  
 
 If there aren't any other tickets to pick up, take from the top of the ready queue.
