@@ -173,18 +173,20 @@ You own ticket state — close tickets yourself, never punt to the user. A ticke
 
 <git-workflow>
 ## Git workflow — mandatory for any code work
-Session start, every step required, in order:
+Concurrent agents must never share one working tree or HEAD — that is exactly how one session's `checkout`/commit clobbers another's. So every task runs in its **own git worktree** off a fresh fetch of the integration branch. Session start, every step required, in order:
 
-1. `git status` — working directory clean
-2. `git checkout master` (or the repo's default branch)
-3. `git branch -u origin/master`
-4. `git pull --rebase`
+1. `git status` — never start on top of unrelated uncommitted work.
+2. **Resolve the integration branch** — the branch work merges *into*. It is NOT assumed to be `master`/`main`; it is whatever recent PRs actually target (often `staging` or `dev`):
+   `BASE=$(bash ~/.claude/skills/lib/integration-branch.sh)` — the single source of truth `[LAW:one-source-of-truth]`. If it errors, STOP and surface it; never guess a base.
+3. `git fetch origin` — get the true current state of `origin/$BASE`.
+4. **Create an isolated worktree off the fresh base and enter it:**
+   `git worktree add "$(git rev-parse --show-toplevel)/.claude/worktrees/<branch>" -b <branch> "origin/$BASE" && cd "$(git rev-parse --show-toplevel)/.claude/worktrees/<branch>"`
 
-**HARD GATE:** after step 4 you are 0 ahead / 0 behind, or you STOP, touch no code, and report the exact state. Working on a stale or diverged master is always wrong; there is no exception.
+**HARD GATE:** the worktree is branched off a *fresh fetch* of `origin/$BASE`, so it is 0 ahead / 0 behind by construction. If you cannot fetch, or the base won't resolve, STOP, touch no code, and report the exact state. Working on a stale or diverged base is always wrong; there is no exception. (The `next` skill performs steps 2–4 for ticket work; this is the same procedure for any non-ticket task.)
 
-5. `git checkout -b <descriptive-branch>` — all work on a branch, never directly on master
-6. Do the work; `git pull --rebase` once or twice a day on longer tasks
+5. Do the work **in the worktree** — never directly on the integration branch.
+6. On longer tasks, `git fetch origin && git rebase "origin/$BASE"` once or twice a day to stay current.
 7. Commit the finished work as its own commit — required, every time. Leave the tree clean.
-8. Open a PR — never push directly to master — and in the same response invoke `/address-pr-reviews` on it. Starting the review loop is part of opening the PR, not a separate step the user triggers. Every PR, every project, unconditionally.
+8. Open a PR **targeting `$BASE`** — never push directly to the integration branch — and in the same response invoke `/address-pr-reviews` on it. Starting the review loop is part of opening the PR, not a separate step the user triggers. Every PR, every project, unconditionally. The review loop's Finalize refreshes onto the live base, merges, and removes the worktree.
 </git-workflow>
 </operations>

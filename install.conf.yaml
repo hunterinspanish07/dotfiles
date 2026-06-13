@@ -31,3 +31,8 @@
       path: config/claude/hooks/tts-stop-hook.sh
     ~/.claude/hooks/tts-toggle.sh:
       path: config/claude/hooks/tts-toggle.sh
+    # litmux — one-command clean tmux session for the current repo. Lands in
+    # ~/go/bin, which is already on PATH (via ~/.zshenv, where `lit` lives too),
+    # so no shell-config change is needed. Relocate if you keep tools elsewhere.
+    ~/go/bin/litmux:
+      path: bin/litmux

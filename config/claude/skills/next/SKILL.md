@@ -67,9 +67,30 @@ IN ALL CASES YOU MUST DO AS MUCH OBVIOUS PREPATORY WORK AS YOU CAN BEFORE ASKING
 
 A mature engineer knows when to ask for help, and it isn't at the slightest hint of ambiguity and before they've put in a shred of effort to answer the question themselves.  "What do I do with this uncommited work" is only a good question if it isn't obviously work that Directly corresponds to the ticket matching the branch name.  "Acceptance criteria missing or vague?" It is only a good question if it's not clearly answerable via common sense or existing documentation or some other method. If there's real ambiguity, surface it. If it's just basic information about the repo, see if you can figure it out for yourself. In all cases, the user should be presented with The results of an Extremely quick Investigation rather than "Hey, I don't know what to do. Tell me what to do." 
 
-5. **Set up the workspace.**
-   - Create or check out The branch matching the ticket ID. eg, `git checkout -b <ticket id>` or  `git checkout -b <ticket id>_slug`
-   - Confirm the working tree is clean before starting. If dirty, Figure it the f*ck out. You're a mature, responsible, highly skilled engineer. 
+5. **Set up an isolated worktree for the ticket.** Concurrent sessions must never share one working tree or HEAD — that is exactly how one agent's `checkout`/commit clobbers another's work. [LAW:no-shared-mutable-globals] every ticket gets its own worktree, branched off a fresh fetch of the integration branch, so any number of sessions run side by side without colliding.
+   - **Find the integration branch** — the branch work merges *into*. Don't assume `main`/`master`; it is whatever recent PRs target (often `staging` or `dev`):
+     ```sh
+     BASE=$(bash ~/.claude/skills/lib/integration-branch.sh) || { echo "stop: cannot resolve integration branch"; exit 1; }
+     ```
+     The helper is the single source of truth. If it errors, STOP and surface it — never guess a base, branching off the wrong one is the staging-drift bug we're preventing. [LAW:no-silent-failure]
+   - **Create the worktree off the fresh base and enter it** (resume into it if it already exists from earlier work on this ticket):
+     ```sh
+     ROOT=$(git rev-parse --show-toplevel)
+     WT="$ROOT/.claude/worktrees/<ticket-id>"
+     git fetch origin
+     if [ -d "$WT" ]; then
+       cd "$WT"                                                       # resume — worktree already exists
+     elif git show-ref --verify --quiet "refs/heads/<ticket-id>"; then
+       git worktree add "$WT" "<ticket-id>" && cd "$WT"              # branch exists (worktree was removed) → re-attach it
+     else
+       git worktree add "$WT" -b "<ticket-id>" "origin/$BASE" && cd "$WT"   # fresh; a real failure (bad base, etc.) surfaces here
+     fi
+     ```
+     Keep the worktree dir out of git locally so it never shows as untracked and is never committed:
+     ```sh
+     printf '%s\n' '.claude/worktrees/' >> "$ROOT/.git/info/exclude"   # idempotent enough; one line, harmless if repeated
+     ```
+   - The worktree is clean by construction — you start from the real integration state, not a stale local HEAD. There is nothing to "figure out" about a dirty tree here; isolation gives you a fresh one every time.
 
 6. **State the plan in one paragraph, then start.** What the ticket asks for, how you'll verify it's done (the machine-verifiable criterion), and the first concrete step. Then begin.
 
