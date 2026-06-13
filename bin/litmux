@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# litmux — one command to land in a clean, named tmux session for the current
+# repo with Claude already running. The lit workflow's message-in-a-bottle
+# handoffs fire into a tmux pane, so "be in a proper tmux session" is a
+# precondition for unattended/chained work — this removes the friction of
+# setting that up by hand. Re-running attaches to the existing session; it
+# never spawns a duplicate.
+#
+# Usage:  litmux [session-name]        # name defaults to the repo directory name
+#         LITMUX_CMD='claude --fast' litmux   # override what a fresh session starts (default: claude)
+set -euo pipefail
+
+command -v tmux >/dev/null || { echo "litmux: tmux is not installed (brew install tmux)" >&2; exit 1; }
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "litmux: not inside a git repo" >&2; exit 1; }
+
+# tmux session names cannot contain '.' or ':'; derive a safe one from the repo.
+RAW=${1:-$(basename "$ROOT")}
+NAME=$(printf '%s' "$RAW" | tr '.:/ ' '____')
+START_CMD=${LITMUX_CMD:-claude}
+
+# Create the session detached and start the workflow in it only when it's new —
+# re-running must not relaunch Claude over a session you're already working in.
+if ! tmux has-session -t "=$NAME" 2>/dev/null; then
+  tmux new-session -d -s "$NAME" -c "$ROOT"
+  tmux send-keys -t "=$NAME" "$START_CMD" Enter
+fi
+
+if [ -n "${TMUX:-}" ]; then
+  tmux switch-client -t "=$NAME"
+else
+  tmux attach-session -t "=$NAME"
+fi

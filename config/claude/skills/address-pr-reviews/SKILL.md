@@ -151,13 +151,37 @@ The loop exits with zero unresolved findings after a clean re-review. The PR is 
 
 [LAW:one-source-of-truth] **follow the tooling's runtime guidance.** Each step's tool (`gh pr merge`, `lit done`, `/recap`) emits its own instructions at runtime — preview tokens, next-step hints, branch-protection messages, admin-bypass prompts, apply-token strings, output paths. The skill describes the *shape* of each step; the tool itself is the authoritative source for *how* to follow through. Read what the tool prints and do what it says — don't paper over a warning, don't guess past a prompt, don't substitute the skill's wording when the tool gave you a literal token or path to use.
 
-### A. Merge the PR
+### A. Refresh onto the live integration branch, then merge
+
+Before merging, rebase onto what the integration branch *actually is right now* — another session or PR may have merged into it while this loop ran. [LAW:no-silent-failure] a stale base is the "staging moved mid-session" hazard; resolve it here, never merge blind over it. The base is detected, never assumed (`main` is often not the merge target — it may be `staging`/`dev`):
+
+```bash
+BASE=$(bash ~/.claude/skills/lib/integration-branch.sh) || { echo "stop: cannot resolve integration branch"; exit 1; }
+git fetch origin
+git rebase "origin/$BASE"
+```
+
+- **Clean rebase** → push the refreshed branch (`git push --force-with-lease`). CI re-runs against the true integration state; the loop's clean review still holds because the diff is unchanged.
+- **Conflict** → you are in this ticket's own worktree with full context. Resolve it, re-run the ticket's verification (tests/build), then continue. If you cannot resolve it confidently, STOP and surface — never force a merge over a conflict you don't understand.
+- **Competing open PR** → check for other open PRs targeting `$BASE` whose changed files overlap yours; if any do, note it in the recap as a heads-up ("PR #N also touches `<file>` — merging may conflict for them"). Flag, don't block: `gh pr merge` itself refuses a real conflict, so the base is never silently corrupted.
+
+Then merge:
 
 ```bash
 gh pr merge "$PR_URL" --squash --delete-branch
 ```
 
 Squash is the repo's configured merge strategy. `--delete-branch` cleans up the remote branch (and the local one if checked out). [LAW:one-source-of-truth] `gh pr merge`'s exit code is the canonical signal of merge success — failure (required checks not satisfied, merge conflict, branch protection) halts Finalize. Don't add a `gh pr view --json merged` check as a second source; the exit code is the truth. At that point the agent's job changes from "close out" to "fix the merge blocker."
+
+Once the merge succeeds, retire this ticket's worktree. You are *inside* it, so step out to the main checkout first — a stale worktree pins a now-deleted branch and clutters the next session:
+
+```bash
+MAIN=$(cd "$(git rev-parse --git-common-dir)/.." && pwd)
+cd "$MAIN"
+git worktree remove "$MAIN/.claude/worktrees/$TICKET_ID" --force
+```
+
+(If this ticket was worked in an old-style in-place branch rather than a worktree, there is nothing to remove — skip it. Any leftover local branch cleanup follows `gh`'s own runtime guidance.)
 
 ### B. Close the lit ticket
 
