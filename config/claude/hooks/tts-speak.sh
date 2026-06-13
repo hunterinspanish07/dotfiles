@@ -38,8 +38,9 @@ else
 fi
 
 # xAI caps a TTS request at 15000 chars; trim the tail so it still speaks.
-# speed 1.2 = a natural but brisk, fast-speaker pace (xAI allows 0.7-1.5).
-jq -n --arg t "${SPEAK:0:15000}" '{text:$t, voice_id:"Ara", language:"en", speed:1.2}' > "$TTS_REQ"
+# speed 1.15 = a natural, lightly-brisk pace that leaves room for the
+# expressive prosody in the summary to land (xAI allows 0.7-1.5).
+jq -n --arg t "${SPEAK:0:15000}" '{text:$t, voice_id:"Ara", language:"en", speed:1.15}' > "$TTS_REQ"
 
 http=$(curl -sS --fail-with-body \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
