@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LaunchAgent: runs the reflect self-improvement loop once daily.
+     Install:  cp this file to ~/Library/LaunchAgents/ then
+               launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hhouse.claude-reflect.plist
+     Stop:     launchctl bootout gui/$(id -u)/com.hhouse.claude-reflect
+     It does NOT RunAtLoad — it only fires on the daily calendar interval. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hhouse.claude-reflect</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/hhouse/.claude/skills/reflect/reflect.sh</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>5</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>WorkingDirectory</key>
+  <string>/Users/hhouse</string>
+  <key>StandardOutPath</key>
+  <string>/Users/hhouse/.claude/reflect/launchd.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/hhouse/.claude/reflect/launchd.err</string>
+</dict>
+</plist>

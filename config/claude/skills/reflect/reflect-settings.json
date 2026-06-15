@@ -1,0 +1,40 @@
+{
+  "_doc": "Least-privilege settings for the headless `reflect` daemon (claude -p --settings this). The miner runs in the wrapper, so the agent needs no arbitrary Bash. Default mode denies anything unlisted; deny rules beat allow. Reads are broad but secrets are denied. Writes are path-scoped to exactly what reflect owns. The only Bash allowed is local git on the dotfiles repo (for apply-mode commits) and the miner — never push, rm, sudo, network, or installs.",
+  "permissions": {
+    "defaultMode": "default",
+    "allow": [
+      "Read(~/**)",
+      "Write(~/.claude/reflect/**)",
+      "Edit(~/.claude/reflect/**)",
+      "Write(~/.claude/skills/**)",
+      "Edit(~/.claude/skills/**)",
+      "Write(~/code/dotfiles/config/claude/**)",
+      "Edit(~/code/dotfiles/config/claude/**)",
+      "Write(~/.claude/projects/**)",
+      "Edit(~/.claude/projects/**)",
+      "Bash(python3 ~/.claude/skills/reflect/mine_friction.py*)",
+      "Bash(git -C ~/code/dotfiles status*)",
+      "Bash(git -C ~/code/dotfiles add *)",
+      "Bash(git -C ~/code/dotfiles commit *)",
+      "Bash(git -C ~/code/dotfiles checkout *)",
+      "Bash(git -C ~/code/dotfiles branch*)",
+      "Bash(git -C ~/code/dotfiles stash*)",
+      "Bash(git -C ~/code/dotfiles diff*)",
+      "Bash(git -C ~/code/dotfiles rm *)"
+    ],
+    "deny": [
+      "Read(~/.claude/.credentials.json)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.config/gh/**)",
+      "Bash(git -C ~/code/dotfiles push*)",
+      "Bash(rm *)",
+      "Bash(sudo *)",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "Bash(ssh *)",
+      "Bash(npm *)",
+      "Bash(pip *)"
+    ]
+  }
+}
