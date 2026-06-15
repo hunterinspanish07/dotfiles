@@ -11,6 +11,8 @@ Read every pending review finding on the PR, address each one, push your fixes (
 
 **Provider** — the active review backend is loaded from `provider.json` in the skill directory (or `PR_REVIEW_PROVIDER` env var). The provider contract is in `PROVIDER_CONTRACT.md`. To switch providers, change `provider.json`; the loop below does not change.
 
+**Review root (local `claude` provider)** — the local reviewer reads the PR's repository for surrounding context, so it must run against the PR's actual checkout. This skill is symlinked from a *different* repo, so the provider cannot trust the process CWD: it resolves the review root from `PR_REVIEW_REPO_ROOT` (preferred) and otherwise the git worktree at CWD, validates the root's origin remote against the PR's `owner/repo`, and **fails loud** on mismatch rather than silently grading the diff alone. When driving the provider, either run it with the PR's worktree as CWD or set `PR_REVIEW_REPO_ROOT` to a checkout of the PR's repo — e.g. `PR_REVIEW_REPO_ROOT="$PWD" PYTHONPATH="<skill-dir>" python3 -c '...'` from the worktree. `[LAW:no-silent-failure]` `[LAW:no-ambient-temporal-coupling]`
+
 ```python
 # Load the provider once at the start of the loop
 import provider_loader

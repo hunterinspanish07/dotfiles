@@ -136,14 +136,98 @@ def setup_check(owner: str, repo: str) -> dict:
             "message": f"claude ({MODEL}, effort={EFFORT}) + gh ready for {owner}/{repo}"}
 
 
-def _repo_root() -> str:
-    """The git worktree root the skill runs in — the code `claude` reads for
-    surrounding context. Falls back to CWD outside a git tree."""
+def _remote_slug(path: str) -> str | None:
+    """The `owner/repo` slug of `path`'s origin remote, lowercased, or None when
+    `path` is not a git repo with an origin remote. Used to confirm a candidate
+    review root is the PR's repository — not whatever repo the process CWD landed
+    in. This skill is symlinked from a *different* repo, so an ambient
+    `git rev-parse` run from the skill dir resolves to that repo, not the PR's."""
     proc = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True
+        ["git", "-C", path, "remote", "get-url", "origin"],
+        capture_output=True, text=True,
     )
-    root = proc.stdout.strip()
-    return root if proc.returncode == 0 and root else os.getcwd()
+    if proc.returncode != 0:
+        return None
+    m = re.search(r"[:/]([^/]+/[^/]+?)(?:\.git)?/?$", proc.stdout.strip())
+    return m.group(1).lower() if m else None
+
+
+def _pr_head_branch(owner: str, repo: str, pr_num: int) -> str | None:
+    raw = github_threads.gh(
+        "pr", "view", str(pr_num), "--repo", f"{owner}/{repo}",
+        "--json", "headRefName",
+    )
+    try:
+        return json.loads(raw).get("headRefName") if raw else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _branch_worktree(repo_path: str, head_branch: str | None) -> str | None:
+    """The worktree under `repo_path` checked out to the PR's head branch, if any
+    — so the reviewer reads the exact code under review rather than whichever
+    branch the chosen root happens to sit on. None when it can't be determined."""
+    if not head_branch:
+        return None
+    proc = subprocess.run(
+        ["git", "-C", repo_path, "worktree", "list", "--porcelain"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    current = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("worktree "):
+            current = line[len("worktree "):]
+        elif line.startswith("branch ") and current:
+            if line[len("branch "):] == f"refs/heads/{head_branch}":
+                return current
+    return None
+
+
+def _repo_root(owner: str, repo: str, pr_num: int) -> str:
+    """The repository directory `claude` reads for surrounding context, resolved
+    to the PR's *actual* repository and validated — never blindly the ambient
+    CWD's repo.
+
+    [LAW:no-ambient-temporal-coupling] the review root must be the PR's repo, not
+    whatever repo the process is standing in. This skill is symlinked from a
+    different repo, so an ambient `git rev-parse` from the skill dir resolves to
+    that repo; the reviewer would then find none of the PR's files.
+
+    [LAW:no-silent-failure] a candidate whose origin remote is not the PR's repo
+    is a hard stop with an actionable message — never a quiet diff-only review
+    (the exact failure this replaces: the model announcing "the repository is not
+    accessible locally" and grading the diff alone).
+
+    Precedence: explicit `PR_REVIEW_REPO_ROOT` env > the git worktree at CWD.
+    Whichever is chosen must be the PR's repo; if it has a worktree checked out
+    to the PR's head branch, that worktree is preferred."""
+    want = f"{owner}/{repo}".lower()
+    env_root = os.environ.get("PR_REVIEW_REPO_ROOT")
+    if env_root:
+        candidate = env_root
+    else:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True
+        )
+        candidate = proc.stdout.strip() if proc.returncode == 0 else ""
+    if not candidate:
+        raise RuntimeError(
+            f"Cannot locate the {owner}/{repo} checkout for the local review: not "
+            "inside a git worktree and PR_REVIEW_REPO_ROOT is unset. Run the skill "
+            f"from the PR's worktree, or set PR_REVIEW_REPO_ROOT to a {owner}/{repo} "
+            "checkout."
+        )
+    slug = _remote_slug(candidate)
+    if slug != want:
+        raise RuntimeError(
+            f"Local review root {candidate!r} is the {slug or 'non-git'} repo, not "
+            f"{owner}/{repo}. The reviewer would find none of the PR's files and "
+            "silently grade the diff alone. Run the skill from the PR's worktree, "
+            f"or set PR_REVIEW_REPO_ROOT to a {owner}/{repo} checkout."
+        )
+    return _branch_worktree(candidate, _pr_head_branch(owner, repo, pr_num)) or candidate
 
 
 def _prior_discussion(owner: str, repo: str, pr_num: int) -> str:
@@ -221,7 +305,7 @@ def _run_review(owner: str, repo: str, pr_num: int) -> str:
              "--allowedTools", ALLOWED_TOOLS,
              "--append-system-prompt", _review_brief()],
             input=prompt, text=True, capture_output=True,
-            cwd=_repo_root(), timeout=CLAUDE_TIMEOUT_S,
+            cwd=_repo_root(owner, repo, pr_num), timeout=CLAUDE_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(
