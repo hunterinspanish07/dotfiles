@@ -189,4 +189,9 @@ Concurrent agents must never share one working tree or HEAD — that is exactly 
 7. Commit the finished work as its own commit — required, every time. Leave the tree clean.
 8. Open a PR **targeting `$BASE`** — never push directly to the integration branch — and in the same response invoke `/address-pr-reviews` on it. Starting the review loop is part of opening the PR, not a separate step the user triggers. Every PR, every project, unconditionally. The review loop's Finalize then takes the PR to its terminal — and **merge is human-gated by DEFAULT**: with no active autonomy grant, Finalize refreshes onto the live base, drives the PR to green-and-reviewed, and STOPS there for the human to merge. An explicit `/auto` grant is the *only* thing that authorizes the agent to merge, remove the worktree, and chain the next eligible ticket — see `/auto` (writes the grant) and `address-pr-reviews` Finalize (`StopForHumanMerge | MergeAndChain`, selected by the grant).
 </git-workflow>
+
+<tooling-economy>
+## Tooling & context economy
+Prefer a **CLI over an MCP server** when the CLI accomplishes the task; reach for an MCP only for capabilities the CLI genuinely lacks (registry discovery/search, private registries, live external state the shell can't reach). An MCP's tool schemas and per-call responses cost context, and every server is a moving part to configure and verify per worktree — across a fleet that compounds. A CLI rides the already-present shell (zero added schema), and you read the artifact it produces for ground truth rather than trusting a tool's self-description. Example: add shadcn/ui components with `npx shadcn@latest add <name>` then read the generated file, instead of wiring the shadcn MCP. `[LAW:carrying-cost]`
+</tooling-economy>
 </operations>
