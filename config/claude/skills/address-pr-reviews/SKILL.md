@@ -153,6 +153,16 @@ The loop exits with zero unresolved findings after a clean re-review — the PR 
 
 [LAW:types-are-the-program] `Finalize = StopForHumanMerge | MergeAndChain`. [LAW:dataflow-not-control-flow] the arm is selected by a fact on disk — does an active grant authorize *this* ticket — not by whether the user seems present, whether merging feels bold, or whether stopping feels safer. [LAW:single-enforcer] that fact comes from the one grant authority (`~/.claude/skills/lib/autonomy-grant.py`); this skill never reimplements the rule or mints a second authorization signal. Per `<ticket-lifecycle>` the agent still owns its close-out — but "close-out" means *driving the PR to the terminal state the grant authorizes*, which by default is "green, reviewed, ready for the human to merge."
 
+### First: flip the Draft to Ready (draft-by-default)
+
+The PR was opened as a **Draft** (see `<git-workflow>`), so wherever the project gates its CI jobs on `draft == false` the review loop above ran with **no CI**. Both terminal arms need a Ready PR — a Draft cannot be merged, and the human merges a Ready PR — so the first Finalize action, before selecting the arm, is to flip it so the single pre-merge CI run starts:
+
+```bash
+gh pr ready "$PR_URL"   # idempotent if the PR is already Ready (e.g. an out-of-band non-Draft PR)
+```
+
+Flipping to Ready fires the one CI run (the draft-gated jobs subscribe to `ready_for_review`); it is the hermetic gate, deferred to the moment it matters. Each arm confirms it green before completing — **StopForHumanMerge** waits explicitly, **MergeAndChain**'s `gh pr merge` refuses to merge until every required check is green. If a check is **red**, it is a finding like any other: fix it on the branch, push (re-runs CI now that the PR is non-Draft), re-confirm green. [LAW:no-silent-failure] a red gate never slips through to a merge.
+
 ### Select the arm
 
 Identify the ticket this PR closes (`$TICKET_ID` — from the PR body, branch name, or the ticket worked this session), then ask the single grant authority whether autonomy is authorized for it:
@@ -172,7 +182,13 @@ A nonzero exit — no grant file, ticket outside the grant's frozen scope, ticke
 
 ### Arm — StopForHumanMerge (default)
 
-The review loop already did the work: the PR is green and reviewed. Nothing remains but to hand it to Hunter. Report, in this turn:
+The review loop did the review; flipping to Ready (above) started the single CI pass. Wait for it to go green, then hand the PR to Hunter:
+
+```bash
+gh pr checks "$PR_URL" --watch --fail-fast   # blocks until the Ready-PR run settles; nonzero on any red check
+```
+
+Once green, report, in this turn:
 
 ```
 PR #<num> — <one-line description> — green & reviewed, ready for your merge.
