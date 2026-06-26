@@ -1,5 +1,25 @@
 {
   "model": "opus[1m]",
+  "permissions": {
+    "allow": [
+      "Bash(git status)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git show:*)",
+      "Bash(git log:*)",
+      "Bash(git fetch:*)",
+      "Bash(git ls-remote:*)",
+      "Bash(git branch --show-current)",
+      "Bash(lit quickstart)",
+      "Bash(lit show:*)",
+      "Bash(lit ls:*)",
+      "Bash(lit ready:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(~/.claude/skills/lib/integration-branch.sh)"
+    ]
+  },
   "hooks": {
     "Stop": [
       {
