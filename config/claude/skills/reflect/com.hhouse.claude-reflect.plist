@@ -26,8 +26,8 @@
   <key>WorkingDirectory</key>
   <string>/Users/hhouse</string>
   <key>StandardOutPath</key>
-  <string>/Users/hhouse/.claude/reflect/launchd.out</string>
+  <string>/Users/hhouse/.local/share/claude-reflect/launchd.out</string>
   <key>StandardErrorPath</key>
-  <string>/Users/hhouse/.claude/reflect/launchd.err</string>
+  <string>/Users/hhouse/.local/share/claude-reflect/launchd.err</string>
 </dict>
 </plist>

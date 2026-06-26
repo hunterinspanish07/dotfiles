@@ -25,13 +25,13 @@ daily job, so it must be **safe by construction**, not safe by review.
   `[LAW:no-mode-explosion]` `[LAW:carrying-cost]`
 - **Self-measuring.** Every run first grades the previous run's artifacts against fresh friction.
   A loop that can't tell if it helped is churn. `[LAW:verifiable-goals]`
-- **Mode-gated.** Read `mode` from `~/.claude/reflect/state.json`. `propose` → apply nothing, write
+- **Mode-gated.** Read `mode` from `~/.local/share/claude-reflect/state.json`. `propose` → apply nothing, write
   the digest only. `apply` → auto-apply the safe tier. Default is `propose` until the user opts in.
 
 ## Procedure
 
 ### 1. Get the friction
-Read the latest `~/.claude/reflect/friction-<date>.json`. The scheduled daemon runs the miner for
+Read the latest `~/.local/share/claude-reflect/friction-<date>.json`. The scheduled daemon runs the miner for
 you (in its wrapper) before invoking this skill, so it usually already exists. If you are running
 manually and today's file is missing, run the miner yourself:
 ```bash
@@ -43,7 +43,7 @@ settings file: writes are path-scoped to what reflect owns, the only Bash allowe
 that is the sandbox working; note it in the digest rather than working around it.
 
 ### 2. Self-measure (close the prior loop)
-Read `~/.claude/reflect/ledger.json` (prior cycles' applied artifacts, each tagged with the
+Read `~/.local/share/claude-reflect/ledger.json` (prior cycles' applied artifacts, each tagged with the
 friction signal it targeted). For each, check the fresh report: did that signal **drop**, stay
 flat, or worsen? Record a verdict. An artifact that didn't help — or a skill it created that was
 never invoked — becomes a **revert-proposal** in the digest. This is how the loop avoids drifting.
@@ -99,14 +99,14 @@ Everything in the forbidden-to-auto list (hooks, edits to existing load-bearing 
 changes) → write as concrete, copy-pasteable proposals in the digest. Do not apply them.
 
 ### 8. Digest + ledger
-Append a dated entry to `~/.claude/reflect/digest.md`:
+Append a dated entry to `~/.local/share/claude-reflect/digest.md`:
 - friction summary (top signals + counts), self-measure verdicts on the prior cycle,
 - what was applied (with the dotfiles commit sha), what was GC'd, what is proposed-only.
-Update `~/.claude/reflect/ledger.json` with this cycle's applied artifacts + their target signals so
+Update `~/.local/share/claude-reflect/ledger.json` with this cycle's applied artifacts + their target signals so
 the next run can grade them.
 
 ## Output
 End with a tight report: the cycle's verdicts, what changed (reversible — name the branch/sha),
 what's proposed for the user to apply, and the current `mode`. If `mode == propose`, state plainly:
-*"propose-only — set `mode: apply` in `~/.claude/reflect/state.json` (or tell me once) to let me
+*"propose-only — set `mode: apply` in `~/.local/share/claude-reflect/state.json` (or tell me once) to let me
 apply the safe tier automatically."*

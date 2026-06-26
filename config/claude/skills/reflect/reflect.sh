@@ -15,9 +15,15 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PA
 export REFLECT_SESSION_ID="$(uuidgen)"
 
 SKILL_DIR="$HOME/.claude/skills/reflect"
-LOG_DIR="$HOME/.claude/reflect"
+LOG_DIR="$HOME/.local/share/claude-reflect"
 mkdir -p "$LOG_DIR"
 cd "$HOME" || exit 1
+
+notify_fail() {
+  # A failed daily run must be visible — launchd has no terminal, so a line buried in
+  # run.log is effectively silent. Surface it natively. [LAW:no-silent-failure]
+  /usr/bin/osascript -e "display notification \"$1\" with title \"reflect daily run failed\""
+}
 
 {
   echo "=== reflect run $(date -u +%FT%TZ) session=$REFLECT_SESSION_ID ==="
@@ -25,6 +31,7 @@ cd "$HOME" || exit 1
   # 1. Mine (wrapper subprocess — not gated by the agent's permissions).
   if ! python3 "$SKILL_DIR/mine_friction.py" --exclude-session "$REFLECT_SESSION_ID"; then
     echo "!!! reflect FAILED: friction miner errored."
+    notify_fail "friction miner errored — see run.log"
     exit 1
   fi
 
@@ -40,6 +47,7 @@ cd "$HOME" || exit 1
   if [ "$rc" -ne 0 ] || printf '%s' "$out" | grep -qiE 'not logged in|please run /login|invalid api key|authentication'; then
     echo "!!! reflect FAILED (rc=$rc): headless claude errored or is unauthenticated."
     echo "!!! Fix: run 'claude login' once in a terminal so the Keychain credential exists for launchd."
+    notify_fail "headless claude errored or unauthenticated (rc=$rc) — run 'claude login'"
     exit 1
   fi
   echo "=== exit $rc ==="

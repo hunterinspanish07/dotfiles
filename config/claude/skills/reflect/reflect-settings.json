@@ -4,8 +4,8 @@
     "defaultMode": "default",
     "allow": [
       "Read(~/**)",
-      "Write(~/.claude/reflect/**)",
-      "Edit(~/.claude/reflect/**)",
+      "Write(~/.local/share/claude-reflect/**)",
+      "Edit(~/.local/share/claude-reflect/**)",
       "Write(~/.claude/skills/**)",
       "Edit(~/.claude/skills/**)",
       "Write(~/code/dotfiles/config/claude/**)",

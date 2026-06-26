@@ -25,8 +25,8 @@ from datetime import datetime, timedelta, timezone
 
 HOME = os.path.expanduser("~")
 DEFAULT_PROJECTS = os.path.join(HOME, ".claude", "projects")
-DEFAULT_STATE = os.path.join(HOME, ".claude", "reflect", "state.json")
-DEFAULT_OUTDIR = os.path.join(HOME, ".claude", "reflect")
+DEFAULT_STATE = os.path.join(HOME, ".local", "share", "claude-reflect", "state.json")
+DEFAULT_OUTDIR = os.path.join(HOME, ".local", "share", "claude-reflect")
 SKILL_DIRS = [
     os.path.join(HOME, ".claude", "skills"),  # user-global (dotfiles symlink)
 ]
