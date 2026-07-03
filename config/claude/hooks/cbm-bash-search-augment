@@ -1,0 +1,53 @@
+#!/bin/bash
+# codebase-memory-mcp: passive graph augmentation for Bash searches.
+#
+# Companion to the vendor Grep/Glob PreToolUse hook. When an agent searches
+# via a Bash grep/rg/find (which the vendor hook does NOT cover) this extracts
+# candidate identifiers from the command, looks each up in the graph via the
+# same `hook-augment` path, and injects the same [codebase-memory] context —
+# passively, with no instruction to the agent. Never blocks; fails silent.
+#
+# Precision: only *specific* hits are surfaced. A token is dropped if it is
+# short, a shell/path noise word, or matches more than MAXHITS symbols (generic
+# substrings like "class"/"config"/"api_server" fan out and are suppressed).
+BIN="/Users/hhouse/.local/bin/codebase-memory-mcp"
+MAXHITS=3
+[ -x "$BIN" ] || exit 0
+
+IN=$(cat)
+CMD=$(printf '%s' "$IN" | jq -r '.tool_input.command // ""' 2>/dev/null)
+CWD=$(printf '%s' "$IN" | jq -r '.cwd // ""' 2>/dev/null)
+[ -n "$CMD" ] || exit 0
+
+# Engage only for search-like commands (otherwise zero graph overhead).
+printf '%s' "$CMD" | grep -qE '(^|[^A-Za-z])(grep|egrep|fgrep|rg|ripgrep|ag|ack)([^A-Za-z]|$)' || exit 0
+
+STOP='^(grep|egrep|fgrep|rg|ripgrep|ag|ack|find|xargs|echo|cat|sort|uniq|head|tail|awk|sed|null|true|false|tests|spec|node_modules|build|coverage|yaml|include|exclude)$'
+
+# Candidate identifiers, >=5 chars. sort -u bounds the set.
+TOKENS=$(printf '%s' "$CMD" | grep -oE '[A-Za-z_][A-Za-z0-9_]{4,}' | sort -u)
+
+lines=""
+attempts=0
+for t in $TOKENS; do
+  [ "$attempts" -ge 15 ] && break
+  printf '%s' "$t" | grep -qiE "$STOP" && continue
+  attempts=$((attempts + 1))
+  payload=$(jq -cn --arg c "$CWD" --arg p "$t" '{cwd:$c,tool_name:"Grep",tool_input:{pattern:$p}}')
+  ctx=$(printf '%s' "$payload" | "$BIN" hook-augment 2>/dev/null | jq -r '.hookSpecificOutput.additionalContext // empty' 2>/dev/null)
+  [ -n "$ctx" ] || continue
+  # Suppress generic tokens: skip if they match more than MAXHITS symbols.
+  hits=$(printf '%s' "$ctx" | grep -oE '[0-9]+ graph symbol' | grep -oE '[0-9]+' | head -1)
+  { [ -n "$hits" ] && [ "$hits" -le "$MAXHITS" ]; } || continue
+  lines="${lines}$(printf '%s' "$ctx" | grep -E '^-[[:space:]]')"$'\n'
+done
+
+lines=$(printf '%s' "$lines" | awk 'NF' | sort -u | head -12)
+[ -z "$lines" ] && exit 0
+n=$(printf '%s\n' "$lines" | awk 'NF' | wc -l | tr -d ' ')
+
+ctx="[codebase-memory] ${n} graph symbol(s) related to this search (structured context; your search results below are unaffected):
+${lines}"
+
+jq -cn --arg c "$ctx" '{hookSpecificOutput:{hookEventName:"PreToolUse",additionalContext:$c}}'
+exit 0

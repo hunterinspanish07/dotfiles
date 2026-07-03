@@ -1,5 +1,4 @@
 {
-  "model": "opus[1m]",
   "permissions": {
     "allow": [
       "Bash(git status)",
@@ -20,6 +19,7 @@
       "Bash(~/.claude/skills/lib/integration-branch.sh)"
     ]
   },
+  "model": "opus[1m]",
   "hooks": {
     "Stop": [
       {
@@ -27,6 +27,66 @@
           {
             "type": "command",
             "command": "bash ~/.claude/hooks/tts-stop-hook.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/cbm-code-discovery-gate",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/cbm-bash-search-augment",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/cbm-session-reminder"
+          }
+        ]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/cbm-session-reminder"
+          }
+        ]
+      },
+      {
+        "matcher": "clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/cbm-session-reminder"
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/cbm-session-reminder"
           }
         ]
       }
