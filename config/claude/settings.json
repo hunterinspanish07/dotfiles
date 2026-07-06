@@ -16,10 +16,12 @@
       "Bash(gh pr list:*)",
       "Bash(gh pr view:*)",
       "Bash(gh pr checks:*)",
-      "Bash(~/.claude/skills/lib/integration-branch.sh)"
+      "Bash(~/.claude/skills/lib/integration-branch.sh)",
+      "Bash(lit queue:*)",
+      "Bash(~/.claude/skills/lib/autonomy-grant.py status:*)"
     ]
   },
-  "model": "opus[1m]",
+  "model": "sonnet",
   "hooks": {
     "Stop": [
       {
