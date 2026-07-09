@@ -13,10 +13,15 @@
 set -euo pipefail
 
 # [LAW:one-source-of-truth] timing lives here once. BOTTLE_DELAY_SECONDS is how
-# long to wait before firing; SETTLE_SECONDS is how long to let the reset render
-# before reading the pane back to verify it ran.
+# long to wait before firing. The reset is not verified with a single fixed
+# settle — a heavy (300k-token) session renders the post-reset banner well after
+# any fixed wait, and a reset typed into a still-busy pane executes only once the
+# agent goes idle. So both the pre-reset idle-wait and the post-reset banner check
+# POLL up to a bound instead of sleeping a fixed interval and reading once.
 BOTTLE_DELAY_SECONDS=10
-SETTLE_SECONDS=5
+POLL_INTERVAL_SECONDS=1
+IDLE_WAIT_SECONDS=20      # max wait for the pane to go idle before sending the reset
+VERIFY_TIMEOUT_SECONDS=20 # max wait for the reset's banner to render after sending
 
 # [LAW:one-source-of-truth] the static framing wrapped around the agent's message
 # lives here once. The launcher composes PREFIX + agent message + SUFFIX into the
@@ -156,39 +161,73 @@ case "$MODE" in
 
     # A reset that actually RAN leaves an app-generated marker on the visible
     # screen that the echoed/queued command text never reproduces — so finding
-    # it can't be fooled by a reset that was swallowed as literal text.
+    # it can't be fooled by a reset that was swallowed as literal text. Captured
+    # VISIBLE-only (no -S): tmux scrollback still holds this session's own
+    # startup banner, and matching that stale copy would be a false positive.
     case "$RESET" in
       clear)   REGISTERED_RE='Claude Code v[0-9]' ;;
       compact) REGISTERED_RE='Compacting conversation|Conversation compacted' ;;
     esac
 
+    # [LAW:types-are-the-program] "the agent is still working" is a state read
+    # off the pane, not a timing assumption. Claude Code's spinner carries a
+    # live elapsed-timer in parens — "(22s · …)", "(1s · esc to interrupt)";
+    # completed-turn remnants read "Cooked for 8s" with no parens, so this
+    # matches only genuine in-progress work.
+    BUSY_RE='\([0-9]+s '
+    pane_busy() { tmux capture-pane -t "$TARGET" -p | grep -qE "$BUSY_RE"; }
+    pane_reset() { tmux capture-pane -t "$TARGET" -p | grep -qE "$REGISTERED_RE"; }
+
     log "waking; target=$TARGET reset=/$RESET"
     sleep "$BOTTLE_DELAY_SECONDS"
 
     # [LAW:dataflow-not-control-flow] Escape cancels whatever was running — we
-    # never inspect what; cancelling is the point. Then submit the reset onto
-    # the now-ready prompt and let it render.
+    # never inspect what; cancelling is the point.
     tmux send-keys -t "$TARGET" Escape
     sleep 1
+
+    # [LAW:no-ambient-temporal-coupling] the reset must land on a ready prompt,
+    # not a fixed guess at when the pane is free. Poll for idle up to a bound —
+    # a reset typed into a busy pane queues as literal text and never registers.
+    idle_waited=0
+    while pane_busy && [ "$idle_waited" -lt "$IDLE_WAIT_SECONDS" ]; do
+      sleep "$POLL_INTERVAL_SECONDS"
+      idle_waited=$((idle_waited + POLL_INTERVAL_SECONDS))
+    done
+
     tmux send-keys -t "$TARGET" "/$RESET"
     sleep 0.5
     tmux send-keys -t "$TARGET" Enter
-    sleep "$SETTLE_SECONDS"
+
+    # [LAW:no-ambient-temporal-coupling] verify by POLLING for the banner, not a
+    # single read after a fixed settle — a heavy session renders it seconds later
+    # than a light one, and the fixed-window read is exactly what produced false
+    # misfires. Succeeds the instant the banner appears, whatever the latency.
+    verify_waited=0
+    while ! pane_reset && [ "$verify_waited" -lt "$VERIFY_TIMEOUT_SECONDS" ]; do
+      sleep "$POLL_INTERVAL_SECONDS"
+      verify_waited=$((verify_waited + POLL_INTERVAL_SECONDS))
+    done
 
     # [LAW:types-are-the-program] the message paste is reachable only after the
-    # reset is verified to have run — it cannot land in an un-reset session. No
-    # marker, no message: surface the misfire in the intact session instead.
-    if tmux capture-pane -t "$TARGET" -p | grep -qE "$REGISTERED_RE"; then
-      log "/$RESET registered; sending message"
+    # reset is verified to have run — it cannot land in an un-reset session.
+    if pane_reset; then
+      log "/$RESET registered after ${verify_waited}s; sending message"
       tmux load-buffer -b "$BUFFER" "$MSGFILE"
       tmux paste-buffer -d -b "$BUFFER" -t "$TARGET" -p
       sleep 0.5
       tmux send-keys -t "$TARGET" Enter
+    elif pane_busy; then
+      # [LAW:no-silent-failure] the reset never rendered AND the pane is still
+      # busy — a queued reset may yet fire. Typing a note now would queue behind
+      # it and leak into the resulting fresh session (the observed symptom).
+      # Leave the pane untouched and surface the misfire only in this log.
+      log "MISFIRE: /$RESET unconfirmed after ${verify_waited}s and pane still busy; pane left untouched"
     else
       log "MISFIRE: /$RESET did not register; message NOT sent"
-      # The session was never reset, so it has a live agent — send it a fixed
-      # note it will surface to the user, rather than silently dropping the
-      # handoff. A fixed string, so send-keys -l carries it directly.
+      # Pane is idle with no banner: the reset was genuinely swallowed, nothing
+      # is queued to fire late, so a note sent now stays in this live session
+      # rather than leaking into a reset. A fixed string, so -l carries it directly.
       tmux send-keys -t "$TARGET" -l "message-in-a-bottle misfired: the scheduled /$RESET never registered, so the queued handoff was NOT sent. Please tell the user the bottle misfired."
       sleep 0.5
       tmux send-keys -t "$TARGET" Enter
