@@ -23,9 +23,9 @@
     "defaultMode": "auto"
   },
   "model": "opus",
-  "enabledPlugins": [
-    { "marketplace": "promptctl", "plugin": "laws" }
-  ],
+  "enabledPlugins": {
+    "laws@promptctl": true
+  },
   "hooks": {
     "Stop": [
       {
@@ -116,5 +116,13 @@
   "remoteControlAtStartup": true,
   "inputNeededNotifEnabled": true,
   "agentPushNotifEnabled": true,
-  "voiceEnabled": true
+  "voiceEnabled": true,
+  "extraKnownMarketplaces": {
+    "promptctl": {
+      "source": {
+        "source": "directory",
+        "path": "/Users/hhouse/code/dotfiles/config/claude/vendor/laws"
+      }
+    }
+  }
 }
