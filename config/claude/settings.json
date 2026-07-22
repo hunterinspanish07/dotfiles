@@ -23,9 +23,6 @@
     "defaultMode": "auto"
   },
   "model": "opus",
-  "enabledPlugins": {
-    "laws@promptctl": true
-  },
   "hooks": {
     "Stop": [
       {
@@ -105,6 +102,18 @@
     "type": "command",
     "command": "bash ~/.claude/statusline-command.sh"
   },
+  "enabledPlugins": {
+    "laws@promptctl": true
+  },
+  "extraKnownMarketplaces": {
+    "promptctl": {
+      "source": {
+        "source": "directory",
+        "path": "/Users/hhouse/code/dotfiles/config/claude/vendor/laws"
+      },
+      "autoUpdate": true
+    }
+  },
   "effortLevel": "medium",
   "voice": {
     "enabled": true,
@@ -116,13 +125,5 @@
   "remoteControlAtStartup": true,
   "inputNeededNotifEnabled": true,
   "agentPushNotifEnabled": true,
-  "voiceEnabled": true,
-  "extraKnownMarketplaces": {
-    "promptctl": {
-      "source": {
-        "source": "directory",
-        "path": "/Users/hhouse/code/dotfiles/config/claude/vendor/laws"
-      }
-    }
-  }
+  "voiceEnabled": true
 }
