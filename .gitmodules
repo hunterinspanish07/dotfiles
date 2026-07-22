@@ -1,0 +1,3 @@
+[submodule "config/claude/vendor/laws"]
+	path = config/claude/vendor/laws
+	url = https://github.com/promptctl/laws

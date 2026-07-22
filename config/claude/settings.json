@@ -23,6 +23,9 @@
     "defaultMode": "auto"
   },
   "model": "opus",
+  "enabledPlugins": [
+    { "marketplace": "promptctl", "plugin": "laws" }
+  ],
   "hooks": {
     "Stop": [
       {

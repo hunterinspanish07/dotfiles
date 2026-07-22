@@ -9,6 +9,12 @@
 - create:
     - ~/.claude
 
+# The architectural laws are vendored as a git submodule (promptctl/laws) so Claude Code
+# and opencode read one source of truth. Initialise it on a fresh checkout.
+- shell:
+    - description: Initialise vendored submodules (promptctl/laws)
+      command: git submodule update --init --recursive
+
 - link:
     ~/.claude/skills:
       path: config/claude/skills
@@ -45,3 +51,9 @@
     # so no shell-config change is needed. Relocate if you keep tools elsewhere.
     ~/go/bin/litmux:
       path: bin/litmux
+    # opencode reads the SAME laws as Claude Code. It cannot run Claude Code plugins, so
+    # this router plugin ports the behaviour: a system-prompt injection routes to ONE
+    # medium each turn, and laws_{code,prompt,prose,ticket} tools return the vendored
+    # skill bodies on demand. Auto-loaded from ~/.config/opencode/plugins/.
+    ~/.config/opencode/plugins/laws-router.js:
+      path: config/opencode/plugins/laws-router.js
