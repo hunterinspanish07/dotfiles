@@ -17,8 +17,10 @@
     <string>/Users/hhouse/.config/runner-guard/runner-guard.sh</string>
   </array>
   <!-- launchd hands agents a bare PATH; docker (via Colima/Homebrew) is in
-       /opt/homebrew/bin. Without this the guard dies on 'docker: command not found'
-       and every run silently no-ops. -->
+       /opt/homebrew/bin. Without this every cycle fails LOUDLY but uselessly — the
+       guard's `docker info` check catches the 'command not found' and dies with a
+       FATAL line in guard.log/launchd.err, exit 2 — never doing its job. So install.sh
+       verifies docker against THIS exact PATH (its single source) before loading. -->
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>

@@ -21,7 +21,15 @@ RUNTIME_GUARD="$HOME/.config/runner-guard/runner-guard.sh"
   echo "       the ~/.config/runner-guard symlink exists, then re-run this." >&2
   exit 1
 }
-command -v docker >/dev/null || { echo "ERROR: docker not on PATH (brew install docker)" >&2; exit 1; }
+# Check docker against the EXACT PATH the launchd agent will run with — read from the
+# plist so that PATH has ONE source, not a second copy here that can drift from it.
+# Validating the installer's ambient PATH instead would pass while the agent hits
+# 'command not found' (docker resolved via /usr/local/bin, a Docker Desktop shim, asdf,
+# …, none of which are on the agent's fixed PATH). [LAW:one-source-of-truth]
+AGENT_PATH=$(plutil -extract EnvironmentVariables.PATH raw -o - "$PLIST_SRC") \
+  || { echo "ERROR: could not read agent PATH from $PLIST_SRC" >&2; exit 1; }
+PATH="$AGENT_PATH" command -v docker >/dev/null \
+  || { echo "ERROR: docker not found on the agent PATH ($AGENT_PATH) — 'brew install docker'?" >&2; exit 1; }
 chmod +x "$RUNTIME_GUARD"
 mkdir -p "$HOME/.local/share/runner-guard" "$HOME/Library/LaunchAgents"
 
