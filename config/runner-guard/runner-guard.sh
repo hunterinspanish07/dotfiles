@@ -118,6 +118,7 @@ if [[ ${#runners[@]} -eq 0 ]]; then
   # especially since the sole rogue is the container most likely to fail inspect.
   if [[ "$inspect_failed" -ne 0 ]]; then
     warn "incomplete: containers were listed but none could be inspected (Docker struggling under load?); guarded nothing this cycle"
+    notify "Runner-guard INCOMPLETE — containers listed but none could be inspected (Docker under load?); a rogue may be hidden. See ${LOG_FILE}."
     exit 4
   fi
   log "no runner containers found (image ${RUNNER_IMAGE_REPO}); nothing to guard"
@@ -243,5 +244,15 @@ done
 #   0  nothing actionable
 # [LAW:types-are-the-program]
 if [[ "$heal_failed"   -ne 0 ]]; then exit 3; fi
-if [[ "$inspect_failed" -ne 0 ]]; then exit 4; fi
+# Exit 4 outranks the handled exit 1, yet until now it only logged — so the outcome
+# that "may be HIDING a rogue" alerted more weakly than a successful heal, and an
+# operator relying on the desktop channel (as they do for both stopped and still-live)
+# would learn nothing. Notify here, at the single terminal — NOT at each per-container
+# inspect failure (which would fire several alerts a cycle, the fatigue round-3 fought)
+# — so incomplete-assessment reaches the same channel as the outcomes it outranks,
+# exactly once. [LAW:no-silent-failure] [LAW:effects-at-boundaries]
+if [[ "$inspect_failed" -ne 0 ]]; then
+  notify "Runner-guard INCOMPLETE — a runner couldn't be inspected this cycle; assessment is partial and may be hiding a rogue. See ${LOG_FILE}."
+  exit 4
+fi
 exit "$rogue_found"
