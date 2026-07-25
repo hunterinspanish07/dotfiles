@@ -161,17 +161,22 @@ for i in "${!runners[@]}"; do
   elif [[ "${unhealthy0[$i]}" -ne 1 ]]; then
     log "watching: $name — unhealthy at t1 only (status ${status}, exit ${exit1}); confirming next cycle"
   elif [[ "$rp1" == "no" ]]; then
-    # Restart policy 'no' → Docker will NOT resurrect it, so BY DEFINITION it is not a
-    # live crash-loop (a loop requires Docker restarting it), whoever set the policy.
-    # The true discriminator is that domain fact, not a proxy for "our heal ran": we key
-    # on "Docker won't restart it → nothing to circuit-break", never on unprovable
-    # history. In practice this is almost always our own prior heal (the latch); it may
-    # also be a runner someone stopped by hand — either way the action is the same and
-    # correct: nothing to stop, so take none. A stopped container isn't the invisible
-    # VM-pinning harm the guard exists to surface (it's plainly visible in `docker ps`),
-    # and re-notifying every 120s is the alert-fatigue path. Sets no exit signal.
-    # [LAW:types-are-the-program] [LAW:no-silent-failure]
-    log "parked: $name — not running, restart policy=no (Docker won't resurrect it); not a live crash-loop, nothing to heal"
+    # Loop already broken: policy 'no' means Docker won't resurrect it, whoever set that
+    # (almost always our own prior heal — the latch). The action is the same regardless
+    # of provenance: ENSURE it is actually stopped. docker stop is idempotent — a no-op,
+    # exit 0, on an already-stopped container (verified) — so running it here also
+    # RETRIES a stop still owed from a partial heal (update --restart=no landed but stop
+    # failed), keeping that path's "will retry next cycle" promise instead of stranding
+    # the owed stop forever. Quietly: no notify (not a new event — the round-3 anti-
+    # fatigue rule) and no rogue_found. A stop that STILL won't land stays owed → exit 3,
+    # retried next cycle. [LAW:no-silent-failure] [LAW:types-are-the-program] [LAW:dataflow-not-control-flow]
+    if [[ "$CHECK_ONLY" != "0" ]]; then
+      log "parked: $name — not running, restart policy=no (Docker won't resurrect it); not a live crash-loop"
+    elif ! err=$(docker stop "$id" 2>&1); then
+      warn "parked but stop still owed: $name ($err); will retry next cycle"; heal_failed=1; continue
+    else
+      log "parked: $name — not running, restart policy=no, stop confirmed; not a live crash-loop"
+    fi
   elif [[ "$CHECK_ONLY" != "0" ]]; then
     # Read-only: a rogue exists but we touch nothing. Advisory exit 1, never "stopped".
     rogue_found=1
