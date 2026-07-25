@@ -1,0 +1,16 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "pr_readonly_reviewer": {
+      "mode": "primary",
+      "description": "Read-only PR reviewer: reads and searches the repo for context but cannot write, patch, run commands, or fetch the web.",
+      "tools": {
+        "write": false,
+        "edit": false,
+        "patch": false,
+        "bash": false,
+        "webfetch": false
+      }
+    }
+  }
+}

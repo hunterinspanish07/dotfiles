@@ -2,7 +2,7 @@
 
 Judge the diff against two bars:
 
-1. **The repository's engineering laws** — `docs/ENGINEERING-PHILOSOPHY.md` is the law of record. When a finding breaks one, cite the exact `[LAW:<token>]` it violates. (If that file is absent, hold the diff to general software-engineering rigor.)
+1. **The engineering laws** — judge the diff against the engineering laws given to you as your **law of record** (provided below this brief). When a finding breaks one, cite the exact `[LAW:<token>]` it violates.
 2. **The linked ticket's Definition of Done** — if the PR description links a ticket, verify the diff actually satisfies each machine-verifiable DoD item.
 
 ## What to hunt (priority order)

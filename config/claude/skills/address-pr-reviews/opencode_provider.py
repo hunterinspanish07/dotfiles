@@ -76,9 +76,24 @@ REVIEW_COMPLETE_RE = re.compile(r"REVIEW_COMPLETE:\s*(\d+)")
 POLL_INTERVAL_S = 10
 WAIT_TIMEOUT_S = 1800
 
+# This CI reviewer's law of record. The shared brief declares the law-of-record
+# as a slot each consumer fills; the LOCAL providers fill it with the canonical
+# vendored laws (they run on this machine and can read them), but opencode runs
+# in GitHub Actions and CANNOT reach the local dotfiles — its only available law
+# source is the repo itself. [LAW:one-source-of-truth] so it names the repo's own
+# `docs/ENGINEERING-PHILOSOPHY.md` as the law of record, which the diff's own repo
+# owns. This is the one law source the CI runner can actually see.
+_CI_LAW_OF_RECORD = (
+    "## Your law of record\n\n"
+    "Your law of record is this repository's `docs/ENGINEERING-PHILOSOPHY.md`. "
+    "When a finding breaks a law, cite the exact `[LAW:<token>]` it violates. If "
+    "that file is absent, hold the diff to general software-engineering rigor."
+)
+
 
 def _trigger_body() -> str:
-    """The `/opencode` trigger comment body — the full adversarial brief.
+    """The `/opencode` trigger comment body — the adversarial brief plus this CI
+    reviewer's law of record appended into the slot the brief declares.
 
     [LAW:no-silent-failure] a missing prompt file would otherwise degrade to a
     bare `/opencode`, which makes opencode summarize instead of review — the
@@ -95,7 +110,7 @@ def _trigger_body() -> str:
             f"{TRIGGER_PROMPT_FILE} must start with '/opencode' so the workflow "
             "fires and the comment is recognized as a trigger."
         )
-    return body
+    return f"{body}\n\n{_CI_LAW_OF_RECORD}"
 
 
 def _gh_json(*args: str):
