@@ -32,6 +32,8 @@
 #      advisory, nothing was stopped)
 #   2  the guard itself could not run (Docker unreachable) — NOT "all healthy"
 #   3  a rogue was found but the heal did NOT land — it is still live (act now)
+#   4  incomplete — a container could not be inspected, so this cycle's assessment is
+#      partial and may be hiding a rogue; never conflated with the clean exit 0
 set -euo pipefail
 
 # One source of truth for "what is a runner to guard": any container built from this
@@ -90,14 +92,18 @@ all_ids=$(docker ps -aq) || die "docker ps failed (VM overloaded or Docker down?
 # by digest, so `--filter ancestor=<repo>` (tag-based) matches nothing — match the ref
 # prefix instead. (Indexed arrays + read-loop, not mapfile/assoc-arrays: portable to
 # macOS bash 3.2, which /bin/bash and the launchd agent actually run.)
+# A per-container inspect failure is not "daemon down" (that's the `docker ps` guard
+# above → exit 2) — it's a container racing away, or Docker struggling to answer under
+# the very VM load a crash-loop induces. Neither die nor silently drop: warn AND record
+# it in `inspect_failed`, so an incomplete assessment surfaces as its own exit code (4)
+# and can never masquerade as a clean "nothing actionable" (0). [LAW:no-silent-failure]
+inspect_failed=0
 runners=()
 while read -r cid; do
   [[ -z "$cid" ]] && continue
-  # A per-container inspect failure here is a container racing away mid-scan, not a
-  # daemon outage — warn loudly (never silently drop, unlike the old `|| continue`)
-  # and move on; don't die and deny protection to the rest of the fleet.
   if ! img=$(docker inspect -f '{{.Config.Image}}' "$cid" 2>&1); then
     warn "skip: inspect failed for $cid during discovery ($img); not guarded this cycle"
+    inspect_failed=1
     continue
   fi
   if [[ "$img" == "$RUNNER_IMAGE_REPO"@* || "$img" == "$RUNNER_IMAGE_REPO":* ]]; then
@@ -106,6 +112,14 @@ while read -r cid; do
 done <<< "$all_ids"
 
 if [[ ${#runners[@]} -eq 0 ]]; then
+  # Empty could mean "genuinely none" OR "some were listed but none could be inspected"
+  # — very different facts. Only the former is the benign exit-0; the latter is an
+  # incomplete assessment (exit 4) that must not read as a clean bill of health,
+  # especially since the sole rogue is the container most likely to fail inspect.
+  if [[ "$inspect_failed" -ne 0 ]]; then
+    warn "incomplete: containers were listed but none could be inspected (Docker struggling under load?); guarded nothing this cycle"
+    exit 4
+  fi
   log "no runner containers found (image ${RUNNER_IMAGE_REPO}); nothing to guard"
   exit 0
 fi
@@ -126,6 +140,7 @@ for i in "${!runners[@]}"; do
   if ! s0=$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "${runners[$i]}" 2>&1); then
     warn "skip: inspect failed for ${runners[$i]} at t0 ($s0); not classified this cycle"
     unhealthy0[$i]=skip
+    inspect_failed=1
     continue
   fi
   read -r st0 ex0 <<< "$s0"
@@ -143,6 +158,7 @@ for i in "${!runners[@]}"; do
   [[ "${unhealthy0[$i]}" == "skip" ]] && continue
   if ! s1=$(docker inspect -f '{{.Name}} {{.State.Status}} {{.State.ExitCode}} {{.RestartCount}} {{.HostConfig.RestartPolicy.Name}}' "$id" 2>&1); then
     warn "skip: inspect failed for $id at t1 ($s1); not classified this cycle"
+    inspect_failed=1
     continue
   fi
   read -r name status exit1 rc1 rp1 <<< "$s1"
@@ -219,7 +235,13 @@ for i in "${!runners[@]}"; do
   fi
 done
 
-# A still-live rogue (heal didn't land) is the loudest actionable outcome — it outranks
-# a clean stop in the exit code so a monitor can escalate it distinctly. [LAW:types-are-the-program]
-if [[ "$heal_failed" -ne 0 ]]; then exit 3; fi
+# Exit precedence, most-severe first — each a distinct outcome a monitor can act on:
+#   3  a known live rogue we couldn't stop (act now) — worst, because it's confirmed
+#   4  incomplete: a container couldn't be inspected, so it may be HIDING a rogue —
+#      ranks above a handled one precisely because the uncertainty could mask harm
+#   1  a rogue was found and stopped (handled) / advisory in CHECK_ONLY
+#   0  nothing actionable
+# [LAW:types-are-the-program]
+if [[ "$heal_failed"   -ne 0 ]]; then exit 3; fi
+if [[ "$inspect_failed" -ne 0 ]]; then exit 4; fi
 exit "$rogue_found"

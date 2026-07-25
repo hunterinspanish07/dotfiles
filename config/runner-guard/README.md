@@ -39,7 +39,8 @@ Exit codes are a contract, each a distinct outcome: `0` nothing actionable (heal
 watching, or parked) · `1` a rogue was found and stopped (in `CHECK_ONLY`: detected —
 advisory, nothing touched) · `2` the guard itself couldn't run (Docker down — never
 misreported as "all healthy") · `3` a rogue was found but the heal didn't land — it's
-still live.
+still live · `4` incomplete — a container couldn't be inspected this cycle, so the
+assessment is partial and may be hiding a rogue (never conflated with the clean `0`).
 
 ## Use
 
