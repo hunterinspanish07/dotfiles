@@ -162,20 +162,28 @@ for i in "${!runners[@]}"; do
     log "watching: $name — unhealthy at t1 only (status ${status}, exit ${exit1}); confirming next cycle"
   elif [[ "$rp1" == "no" ]]; then
     # Loop already broken: policy 'no' means Docker won't resurrect it, whoever set that
-    # (almost always our own prior heal — the latch). The action is the same regardless
-    # of provenance: ENSURE it is actually stopped. docker stop is idempotent — a no-op,
-    # exit 0, on an already-stopped container (verified) — so running it here also
-    # RETRIES a stop still owed from a partial heal (update --restart=no landed but stop
-    # failed), keeping that path's "will retry next cycle" promise instead of stranding
-    # the owed stop forever. Quietly: no notify (not a new event — the round-3 anti-
-    # fatigue rule) and no rogue_found. A stop that STILL won't land stays owed → exit 3,
-    # retried next cycle. [LAW:no-silent-failure] [LAW:types-are-the-program] [LAW:dataflow-not-control-flow]
+    # (almost always our own prior heal — the latch). Ensure it is actually stopped;
+    # docker stop is idempotent — a verified no-op/exit-0 on an already-stopped container
+    # — so this also RETRIES a stop owed by a partial heal (update landed, stop failed),
+    # keeping that path's "will retry" promise. What we SAY depends on the effect this
+    # cycle had: if the stop failed, the heal is still owed → loud + exit 3. If the stop
+    # did real work (pre-stop status wasn't exited: an owed stop finally landing) → that
+    # completes a circuit-break, so shout once and count it (rogue_found → exit 1). If it
+    # was already stopped → a benign no-op on a long-parked container → stay silent
+    # (round-3 anti-fatigue). Broken things keep shouting, settled things go quiet.
+    # [LAW:no-silent-failure] [LAW:types-are-the-program] [LAW:dataflow-not-control-flow]
     if [[ "$CHECK_ONLY" != "0" ]]; then
       log "parked: $name — not running, restart policy=no (Docker won't resurrect it); not a live crash-loop"
     elif ! err=$(docker stop "$id" 2>&1); then
-      warn "parked but stop still owed: $name ($err); will retry next cycle"; heal_failed=1; continue
+      warn "STILL LIVE: could not stop $name ($err); heal owed, will retry next cycle"
+      notify "Runner ${name} STILL LIVE — stop failed ($err). See ${LOG_FILE}."
+      heal_failed=1; continue
+    elif [[ "$status" != "exited" && "$status" != "dead" ]]; then
+      rogue_found=1
+      warn "STOPPED: $name — completed an owed circuit-break. Root-cause it (broken image / dead PAT / OOM), then recreate per that project's runner docs (docs/CI-RUNNERS.md)."
+      notify "Stopped rogue runner ${name} (owed stop completed). See ${LOG_FILE}."
     else
-      log "parked: $name — not running, restart policy=no, stop confirmed; not a live crash-loop"
+      log "parked: $name — not running, restart policy=no, already stopped; not a live crash-loop"
     fi
   elif [[ "$CHECK_ONLY" != "0" ]]; then
     # Read-only: a rogue exists but we touch nothing. Advisory exit 1, never "stopped".
@@ -190,13 +198,20 @@ for i in "${!runners[@]}"; do
     # warn WITH the captured docker error (every other failure path here does the same)
     # and continue — don't die (exit 2 = daemon unreachable) or abort the batch. The
     # container is STILL LIVE, so this is exit 3 (heal_failed), never the "stopped"
-    # exit 1 — the exit code must not claim a heal that didn't land.
-    # [LAW:effects-at-boundaries] [LAW:no-silent-failure] [LAW:types-are-the-program]
+    # exit 1 — the exit code must not claim a heal that didn't land — AND it must SHOUT:
+    # a still-live rogue is the loudest actionable outcome, so it notifies (like success
+    # does), not merely logs. It keeps notifying each cycle it stays broken, which is
+    # correct — unlike a settled parked container (round-3), an un-healable rogue is
+    # genuinely still on fire. [LAW:effects-at-boundaries] [LAW:no-silent-failure] [LAW:types-are-the-program]
     if ! err=$(docker update --restart=no "$id" 2>&1); then
-      warn "heal failed: could not disable restart policy on $name ($err); will retry next cycle"; heal_failed=1; continue
+      warn "STILL LIVE: could not disable restart policy on $name ($err); will retry next cycle"
+      notify "Runner ${name} STILL LIVE — heal failed ($err). See ${LOG_FILE}."
+      heal_failed=1; continue
     fi
     if ! err=$(docker stop "$id" 2>&1); then
-      warn "heal failed: could not stop $name ($err); will retry next cycle"; heal_failed=1; continue
+      warn "STILL LIVE: could not stop $name ($err); will retry next cycle"
+      notify "Runner ${name} STILL LIVE — stop failed ($err). See ${LOG_FILE}."
+      heal_failed=1; continue
     fi
     rogue_found=1   # set only AFTER the stop actually lands — exit 1 means "stopped"
     warn "STOPPED: $name is halted. Root-cause it (broken image / dead PAT / OOM), then recreate per that project's runner docs (docs/CI-RUNNERS.md)."
