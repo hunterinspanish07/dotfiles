@@ -137,42 +137,51 @@ for i in "${!runners[@]}"; do
   id="${runners[$i]}"
   # Already unreachable at t0 — warned there; carry the skip, don't re-warn or classify.
   [[ "${unhealthy0[$i]}" == "skip" ]] && continue
-  if ! s1=$(docker inspect -f '{{.Name}} {{.State.Status}} {{.State.ExitCode}} {{.RestartCount}}' "$id" 2>&1); then
+  if ! s1=$(docker inspect -f '{{.Name}} {{.State.Status}} {{.State.ExitCode}} {{.RestartCount}} {{.HostConfig.RestartPolicy.Name}}' "$id" 2>&1); then
     warn "skip: inspect failed for $id at t1 ($s1); not classified this cycle"
     continue
   fi
-  read -r name status exit1 rc1 <<< "$s1"
+  read -r name status exit1 rc1 rp1 <<< "$s1"
   name="${name#/}"
 
-  # The strongest true theorem about "rogue": unhealthy (bad exit AND not running) at
-  # BOTH samples. Backoff-independent — a deeply-throttled loop is still 'restarting +
-  # non-zero exit' the whole window. Healthy exit-0 cycling and one-off blips that
-  # recover both fail one of the gates. [LAW:types-are-the-program]
-  if [[ "${unhealthy0[$i]}" -eq 1 && "$exit1" -ne 0 && "$status" != "running" ]]; then
+  # Three domain states, told apart by two gates. UNHEALTHY = bad exit AND not running
+  # at BOTH samples — backoff-independent, since a deeply-throttled loop is still
+  # non-zero-exit + not-running the whole window. Among the unhealthy, the restart
+  # POLICY discriminates a live crash-loop Docker keeps resurrecting (policy != no)
+  # from one we already circuit-broke (we set --restart=no), which now just sits parked
+  # awaiting the operator. Healthy exit-0 cycling fails the exit gate. [LAW:types-are-the-program]
+  if [[ "${unhealthy0[$i]}" -ne 1 || "$exit1" -eq 0 || "$status" == "running" ]]; then
+    log "healthy: $name — status ${status}, exit ${exit1} (total restarts ${rc1})"
+  elif [[ "$rp1" == "no" ]]; then
+    # Already circuit-broken by a prior cycle: Docker is NOT restarting it, so it's not
+    # a live crash-loop — parked, awaiting operator fix/recreate. Log once per cycle
+    # (stays visible, never silent) but do NOT re-notify or re-heal: a breaker trips
+    # once and stays open; re-alerting every 120s forever is the alert-fatigue path
+    # that gets the channel muted. Not a NEW rogue, so it doesn't set rogue_found.
+    # [LAW:types-are-the-program]
+    log "parked: $name — already circuit-broken (status ${status}, exit ${exit1}); awaiting operator fix/recreate"
+  else
     rogue_found=1
     if [[ "$CHECK_ONLY" != "0" ]]; then
       warn "ROGUE: $name — status ${status}, exit ${exit1}, unhealthy ${WINDOW_SECS}s+ (total restarts ${rc1}); WOULD circuit-break (CHECK_ONLY)"
     else
       warn "ROGUE: $name — status ${status}, exit ${exit1}, unhealthy ${WINDOW_SECS}s+ (total restarts ${rc1}); circuit-breaking"
-      # Halt the loop at the source: drop the always-restart policy first so Docker
-      # cannot immediately resurrect it, then stop. Left stopped (not removed) so its
-      # logs survive for the operator to fix the root cause and recreate from that
-      # project's own documented run command. [LAW:effects-at-boundaries]
-      # A heal failure on ONE container (concurrently removed/recreated on the shared
-      # VM, transient EBUSY) is not "Docker is down" — don't die (exit 2 means daemon
-      # unreachable) and don't abort the batch, or a second rogue this cycle goes
-      # un-healed. Warn, leave rogue_found=1 set, and retry next cycle. [LAW:types-are-the-program]
-      if ! docker update --restart=no "$id" >/dev/null 2>&1; then
-        warn "heal failed: could not disable restart policy on $name; will retry next cycle"; continue
+      # Drop the always-restart policy first so Docker can't immediately resurrect it,
+      # then stop. Left stopped (not removed) so logs survive for the operator to
+      # root-cause and recreate. A heal failure on ONE container (concurrently
+      # removed/recreated on the shared VM, transient EBUSY) is not "Docker is down":
+      # warn WITH the captured docker error (every other failure path here does the
+      # same) and continue — don't die (exit 2 = daemon unreachable) or abort the batch;
+      # rogue_found stays 1. [LAW:effects-at-boundaries] [LAW:no-silent-failure]
+      if ! err=$(docker update --restart=no "$id" 2>&1); then
+        warn "heal failed: could not disable restart policy on $name ($err); will retry next cycle"; continue
       fi
-      if ! docker stop "$id" >/dev/null 2>&1; then
-        warn "heal failed: could not stop $name; will retry next cycle"; continue
+      if ! err=$(docker stop "$id" 2>&1); then
+        warn "heal failed: could not stop $name ($err); will retry next cycle"; continue
       fi
       warn "STOPPED: $name is halted. Root-cause it (broken image / dead PAT / OOM), then recreate per that project's runner docs (docs/CI-RUNNERS.md)."
       notify "Stopped rogue runner ${name} (exit ${exit1}, crash-looping). See ${LOG_FILE}."
     fi
-  else
-    log "healthy: $name — status ${status}, exit ${exit1} (total restarts ${rc1})"
   fi
 done
 

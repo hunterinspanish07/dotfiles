@@ -30,6 +30,11 @@ does **not** recreate the container — the per-project PAT/repo/labels live in 
 project's own `docs/CI-RUNNERS.md`, and guessing them would be silent-wrong. Fix the
 root cause, then recreate from that project's Setup block.
 
+The breaker **latches**: once stopped, the container's restart policy is `no`, so on
+later cycles it's classified `parked` — logged (so it stays visible) but never
+re-healed or re-notified. A breaker trips once and stays open; it does not re-alert
+every 2 minutes until you recreate the runner.
+
 Exit codes are a contract: `0` all healthy · `1` a rogue was found+stopped · `2` the
 guard itself couldn't run (Docker down — never misreported as "all healthy").
 
