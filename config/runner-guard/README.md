@@ -35,8 +35,11 @@ later cycles it's classified `parked` — logged (so it stays visible) but never
 re-healed or re-notified. A breaker trips once and stays open; it does not re-alert
 every 2 minutes until you recreate the runner.
 
-Exit codes are a contract: `0` all healthy · `1` a rogue was found+stopped · `2` the
-guard itself couldn't run (Docker down — never misreported as "all healthy").
+Exit codes are a contract, each a distinct outcome: `0` nothing actionable (healthy,
+watching, or parked) · `1` a rogue was found and stopped (in `CHECK_ONLY`: detected —
+advisory, nothing touched) · `2` the guard itself couldn't run (Docker down — never
+misreported as "all healthy") · `3` a rogue was found but the heal didn't land — it's
+still live.
 
 ## Use
 
