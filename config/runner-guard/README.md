@@ -31,9 +31,12 @@ project's own `docs/CI-RUNNERS.md`, and guessing them would be silent-wrong. Fix
 root cause, then recreate from that project's Setup block.
 
 The breaker **latches**: once stopped, the container's restart policy is `no`, so on
-later cycles it's classified `parked` — logged (so it stays visible) but never
-re-healed or re-notified. A breaker trips once and stays open; it does not re-alert
-every 2 minutes until you recreate the runner.
+later cycles it's classified `parked` — logged so it stays visible, and a container
+that's already stopped is never re-notified. A breaker trips once and stays open; it
+does not re-alert every 2 minutes until you recreate the runner. The one exception is a
+stop left *owed* by a partial heal (policy dropped but the stop failed): the parked
+branch retries that stop each cycle and fires a single confirming alert on the cycle it
+finally lands — then goes quiet.
 
 Exit codes are a contract, each a distinct outcome: `0` nothing actionable (healthy,
 watching, or parked) · `1` a rogue was found and stopped (in `CHECK_ONLY`: detected —
