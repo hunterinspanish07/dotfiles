@@ -161,12 +161,17 @@ for i in "${!runners[@]}"; do
   elif [[ "${unhealthy0[$i]}" -ne 1 ]]; then
     log "watching: $name — unhealthy at t1 only (status ${status}, exit ${exit1}); confirming next cycle"
   elif [[ "$rp1" == "no" ]]; then
-    # Already circuit-broken by a prior cycle: Docker is NOT restarting it, so it's not
-    # a live crash-loop — parked, awaiting operator fix/recreate. Log once per cycle
-    # (stays visible, never silent) but do NOT re-notify or re-heal: a breaker trips
-    # once and stays open; re-alerting every 120s forever is the alert-fatigue path
-    # that gets the channel muted. Not a NEW rogue, so it sets no exit signal.
-    log "parked: $name — already circuit-broken (status ${status}, exit ${exit1}); awaiting operator fix/recreate"
+    # Restart policy 'no' → Docker will NOT resurrect it, so BY DEFINITION it is not a
+    # live crash-loop (a loop requires Docker restarting it), whoever set the policy.
+    # The true discriminator is that domain fact, not a proxy for "our heal ran": we key
+    # on "Docker won't restart it → nothing to circuit-break", never on unprovable
+    # history. In practice this is almost always our own prior heal (the latch); it may
+    # also be a runner someone stopped by hand — either way the action is the same and
+    # correct: nothing to stop, so take none. A stopped container isn't the invisible
+    # VM-pinning harm the guard exists to surface (it's plainly visible in `docker ps`),
+    # and re-notifying every 120s is the alert-fatigue path. Sets no exit signal.
+    # [LAW:types-are-the-program] [LAW:no-silent-failure]
+    log "parked: $name — not running, restart policy=no (Docker won't resurrect it); not a live crash-loop, nothing to heal"
   elif [[ "$CHECK_ONLY" != "0" ]]; then
     # Read-only: a rogue exists but we touch nothing. Advisory exit 1, never "stopped".
     rogue_found=1
