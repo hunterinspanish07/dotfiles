@@ -50,9 +50,13 @@ LOG_FILE="${RUNNER_GUARD_LOG:-$HOME/.local/share/runner-guard/guard.log}"
 # verifying the classifier without touching the fleet. [LAW:effects-at-boundaries]
 CHECK_ONLY="${RUNNER_GUARD_CHECK_ONLY:-0}"
 
-mkdir -p "$(dirname "$LOG_FILE")"
-log()  { printf '%s runner-guard: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" | tee -a "$LOG_FILE"; }
-warn() { printf '%s runner-guard: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" | tee -a "$LOG_FILE" >&2; }
+mkdir -p "$(dirname "$LOG_FILE")" || true
+# `|| true` on the tee: a logging effect (disk full, unwritable log) must NEVER abort
+# the caller under `set -e` — otherwise errexit could kill the script on the `warn`
+# line immediately before a heal, and the one thing this tool guarantees (stopping a
+# rogue) silently wouldn't happen. Same isolation notify() already has. [LAW:effects-at-boundaries]
+log()  { printf '%s runner-guard: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" | tee -a "$LOG_FILE" || true; }
+warn() { printf '%s runner-guard: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" | tee -a "$LOG_FILE" >&2 || true; }
 # Docker being unreachable is the guard failing, not the runners passing. Reporting
 # "all healthy" here would be the silent-fallback trap: a wrong map at the worst
 # moment. Fail loud, exit 2. [LAW:no-silent-failure]
@@ -154,8 +158,16 @@ for i in "${!runners[@]}"; do
       # cannot immediately resurrect it, then stop. Left stopped (not removed) so its
       # logs survive for the operator to fix the root cause and recreate from that
       # project's own documented run command. [LAW:effects-at-boundaries]
-      docker update --restart=no "$id" >/dev/null || die "could not disable restart policy on $name"
-      docker stop "$id" >/dev/null            || die "could not stop $name"
+      # A heal failure on ONE container (concurrently removed/recreated on the shared
+      # VM, transient EBUSY) is not "Docker is down" — don't die (exit 2 means daemon
+      # unreachable) and don't abort the batch, or a second rogue this cycle goes
+      # un-healed. Warn, leave rogue_found=1 set, and retry next cycle. [LAW:types-are-the-program]
+      if ! docker update --restart=no "$id" >/dev/null 2>&1; then
+        warn "heal failed: could not disable restart policy on $name; will retry next cycle"; continue
+      fi
+      if ! docker stop "$id" >/dev/null 2>&1; then
+        warn "heal failed: could not stop $name; will retry next cycle"; continue
+      fi
       warn "STOPPED: $name is halted. Root-cause it (broken image / dead PAT / OOM), then recreate per that project's runner docs (docs/CI-RUNNERS.md)."
       notify "Stopped rogue runner ${name} (exit ${exit1}, crash-looping). See ${LOG_FILE}."
     fi
