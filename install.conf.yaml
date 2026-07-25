@@ -45,3 +45,9 @@
     # so no shell-config change is needed. Relocate if you keep tools elsewhere.
     ~/go/bin/litmux:
       path: bin/litmux
+    # runner-guard — machine-wide circuit breaker for crash-looping self-hosted CI
+    # runners. Links the whole dir so the launchd plist references a stable runtime
+    # path (~/.config/runner-guard/runner-guard.sh). Loading the agent is a one-time
+    # launchctl step dotbot can't do: run ~/.config/runner-guard/install.sh after link.
+    ~/.config/runner-guard:
+      path: config/runner-guard

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LaunchAgent: circuit-breaks crash-looping self-hosted CI runners, machine-wide.
+     Install/stop: run ./install.sh in this directory (idempotent), or by hand:
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hhouse.runner-guard.plist
+       launchctl bootout   gui/$(id -u)/com.hhouse.runner-guard
+     Paths are absolute by this repo's convention (single-user machine); the script is
+     the dotbot-linked ~/.config/runner-guard/runner-guard.sh. It DOES RunAtLoad (catch
+     a rogue at boot/login) and re-checks every 120s. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hhouse.runner-guard</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/hhouse/.config/runner-guard/runner-guard.sh</string>
+  </array>
+  <!-- launchd hands agents a bare PATH; docker (via Colima/Homebrew) is in
+       /opt/homebrew/bin. Without this the guard dies on 'docker: command not found'
+       and every run silently no-ops. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>120</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/hhouse/.local/share/runner-guard/launchd.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/hhouse/.local/share/runner-guard/launchd.err</string>
+</dict>
+</plist>
