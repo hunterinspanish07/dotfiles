@@ -16,13 +16,16 @@
       "Bash(gh pr list:*)",
       "Bash(gh pr view:*)",
       "Bash(gh pr checks:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh pr ready:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(gh api:*)",
       "Bash(~/.claude/skills/lib/integration-branch.sh)",
       "Bash(lit queue:*)",
       "Bash(~/.claude/skills/lib/autonomy-grant.py status:*)"
     ],
     "defaultMode": "auto"
   },
-  "model": "opus",
   "hooks": {
     "Stop": [
       {
