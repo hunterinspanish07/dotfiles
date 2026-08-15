@@ -100,7 +100,7 @@ set -euo pipefail
 # home and every sweep reads it. [LAW:one-source-of-truth]
 #
 # AGE_HOURS_MIN is the live-job safety floor made unrepresentable-to-violate: the
-# platform's own job ceiling is 6h, so anything below 7h would make sweep 3's
+# platform's own job ceiling is 6h, so anything below 7h would make sweep 1's
 # `docker rm -f` eligible to kill service containers still attached to an in-progress
 # job. Validated (not clamped) after `die` exists — a misconfigured floor refuses to
 # run rather than executing a destructive sweep under a false safety invariant.
@@ -178,7 +178,8 @@ mkdir -p "$(dirname "$LOG_FILE")" || {
 
 incomplete=0      # something could not be removed or could not be aged — sweep is partial
 reclaimed=0       # count of objects actually removed (or that a dry run would remove)
-age_deferred=0    # allowlist hits younger than the floor (not a fault; holds high-water)
+age_deferred=0    # allowlist hits younger than the floor (covered residue)
+kept_referenced=0 # aged allowlist hits kept as benign "in use" (covered residue)
 state_unarmed=0   # agent ran but the staleness clock could not be written
 disk_unmeasured=0 # agent ran but the high-water check could not read the disk
 state_unknown=0   # stamp existed but was unreadable/malformed (not a measured dead-agent gap)
@@ -286,7 +287,8 @@ remove_one() {
     *"is being used"*|*"in use"*)
       case "$what" in
         image|volume)
-          log "kept ${what}: ${label} — still in use" ;;
+          log "kept ${what}: ${label} — still in use"
+          kept_referenced=$(( kept_referenced + 1 )) ;;
         *)
           warn "FAILED to remove ${what} ${label}: ${err}"
           incomplete=1 ;;
@@ -468,14 +470,17 @@ fi
 # alarm; only the exit code is a single winner. [LAW:no-silent-failure]
 log "done${mode_note}: ${reclaimed} object(s) $([[ "$DRY_RUN" -ne 0 ]] && echo 'would be removed' || echo 'removed')${age_deferred:+; ${age_deferred} under age floor}"
 
-# High-water's contract is "disk still high AFTER reclaiming everything these sweeps
-# cover" — look outside the three signatures. Not when incomplete=1 (sweep didn't
-# finish), not on dry-run (nothing deleted), and not when age_deferred>0 (matching
-# CI garbage is simply under the floor and will age in). [LAW:comments-carry-meaning]
-high_water=0
+# Disk pressure and "outside source" are two facts. Exit 4 is only the outside
+# diagnosis (eligible set empty, residue must be something we don't cover). Covered
+# residue (young skips + benign in-use keeps) must still SHOUT about the pressure —
+# silence while the disk is full of reclaimable CI garbage is the original harm —
+# but must not claim an uncovered source. [LAW:types-are-the-program] [LAW:no-silent-failure]
+high_water=0          # exit 4: outside source
+disk_pressure_covered=0  # notify only: disk high, covered residue remains
+covered_residue=$(( age_deferred + kept_referenced ))
 if [[ "$DRY_RUN" -eq 0 && "$incomplete" -eq 0 && -n "$disk_pct" && "$disk_pct" -ge "$DISK_WARN_PCT" ]]; then
-  if [[ "$age_deferred" -gt 0 ]]; then
-    log "disk ${disk_pct}% used but ${age_deferred} allowlist object(s) still under the ${AGE_HOURS}h floor — not raising high-water (covered garbage, not an outside source)"
+  if [[ "$covered_residue" -gt 0 ]]; then
+    disk_pressure_covered=1
   else
     high_water=1
   fi
@@ -509,6 +514,10 @@ fi
 if [[ "$disk_unmeasured" -ne 0 ]]; then
   warn "DISK UNMEASURED: could not read usage of $DOCKER_DISK — high-water check did not run this cycle"
   notify "CI janitor could not measure the Docker disk — high-water check skipped. See ${LOG_FILE}."
+fi
+if [[ "$disk_pressure_covered" -ne 0 ]]; then
+  warn "DISK PRESSURE: ${DOCKER_DISK} at ${disk_pct}% with ${covered_residue} covered CI object(s) still present (${age_deferred} under age floor, ${kept_referenced} in use) — not an outside source; they will age in or free when unreferenced"
+  notify "CI janitor: disk at ${disk_pct}% — covered CI garbage still present (aging in / in use), not an outside source. See ${LOG_FILE}."
 fi
 if [[ "$high_water" -ne 0 ]]; then
   warn "HIGH WATER: ${DOCKER_DISK} still ${disk_pct}% used after reclaiming every eligible object — something outside these sweeps is filling it. Inspect with: docker system df -v"

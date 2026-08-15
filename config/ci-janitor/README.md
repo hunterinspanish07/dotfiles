@@ -69,7 +69,7 @@ ever touched, in any sweep. Jobs on this host take 1–2 minutes and the platfor
 is 6 hours, so nothing the janitor can see could belong to a job still running.
 
 The floor is enforced, not just documented: values below **7h** (platform ceiling + 1h
-margin) are refused at startup. A free dial that accepted `1` would make sweep 3's
+margin) are refused at startup. A free dial that accepted `1` would make sweep 1's
 `docker rm -f` eligible to kill service containers still on an in-progress job.
 
 ## How you find out it broke
