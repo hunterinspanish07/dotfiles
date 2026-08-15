@@ -102,7 +102,8 @@ This table mirrors the `EXIT CODES` block at the top of `ci-janitor.sh`; change 
 ## Usage
 
 ```bash
-# Rehearse: prints exactly what it would delete, deletes nothing, same exit codes.
+# Rehearse: prints exactly what it would delete, deletes nothing. Same exit 2/3 from
+# classification failures; does not raise exit 4 (high-water) or arm the staleness stamp.
 ~/.config/ci-janitor/ci-janitor.sh --dry-run
 
 # Real sweep.

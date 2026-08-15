@@ -58,8 +58,9 @@
 # Not by polling for running jobs, and not by a settle-sleep — both are races. The age
 # floor IS the guarantee: jobs on this host take 1-2 minutes and the platform's own
 # ceiling is 6 hours, so at the 24h default nothing this script can see could belong to
-# a job still running. The temporal invariant is a property of the data, not a hope
-# about timing. [LAW:no-ambient-temporal-coupling]
+# a job still running. Age is computed entirely in the Docker daemon's clock domain
+# (SystemTime and CreatedAt share one clock) so Mac-vs-VM drift cannot push a live job
+# under the floor. [LAW:no-ambient-temporal-coupling]
 #
 # HOW YOU FIND OUT IT BROKE
 # The whole point of this script is that silent accumulation is what hurt. So it is
@@ -120,7 +121,9 @@ STATE_FILE="${CI_JANITOR_STATE:-$HOME/.local/share/ci-janitor/last-run}"
 DOCKER_DISK="${CI_JANITOR_DOCKER_DISK:-/var/lib/docker}"
 
 # Read-only mode: classify and report every candidate exactly as a real run would, and
-# hold the deletions. Same exit codes, so a dry run is a truthful rehearsal.
+# hold the deletions. Preserves exit 2 (can't run) and exit 3 from classification /
+# inspect failures. Deliberately does NOT raise exit 4 (high-water needs a real clean
+# sweep) or arm the staleness stamp — those are real-run outcomes.
 # [LAW:effects-at-boundaries]
 DRY_RUN=0
 for arg in "$@"; do
@@ -204,8 +207,11 @@ epoch_of() {
   date -j -f '%Y-%m-%d %H:%M:%S%z' "${datetime}${zflag}" +%s 2>/dev/null
 }
 
-NOW=$(date +%s)
-CUTOFF=$(( NOW - AGE_HOURS * 3600 ))
+# Host clock: launchd and STATE_FILE live on the Mac. Used only for the staleness gap.
+NOW_HOST=$(date +%s)
+# Daemon clock + CUTOFF are set after preflight — age comparisons must share the
+# Docker daemon's clock domain with CreatedAt stamps. [LAW:no-ambient-temporal-coupling]
+CUTOFF=""
 
 # True only when the object is provably older than the floor. An unparseable timestamp
 # returns FALSE — the object is kept and the run is marked incomplete. Failing closed is
@@ -278,6 +284,17 @@ remove_one() {
 # --- preflight ----------------------------------------------------------------
 docker info >/dev/null 2>&1 || die "Docker daemon unreachable (is Colima up? 'colima start')"
 
+# Age floor shares the daemon's clock with CreatedAt. Host `date +%s` after Mac sleep
+# can lead the Colima VM by hours; lag makes every object look older and can put a
+# live job under the 7h minimum. Fail closed if daemon time is unreadable — same
+# posture as an unparseable object stamp. [LAW:no-ambient-temporal-coupling]
+daemon_now_raw=$(docker info --format '{{.SystemTime}}') \
+  || die "docker info SystemTime unreadable — cannot establish the age floor"
+NOW_DAEMON=$(epoch_of "$daemon_now_raw") \
+  || die "could not parse daemon SystemTime '$daemon_now_raw' — cannot establish the age floor"
+[[ -n "$NOW_DAEMON" ]] || die "daemon SystemTime parsed empty — cannot establish the age floor"
+CUTOFF=$(( NOW_DAEMON - AGE_HOURS * 3600 ))
+
 # Did the janitor itself stop running? Only detectable once it runs again after a gap,
 # but that is precisely the case worth catching: an agent silently unloaded for weeks
 # while the disk refilled. [LAW:no-silent-failure]
@@ -287,12 +304,12 @@ docker info >/dev/null 2>&1 || die "Docker daemon unreachable (is Colima up? 'co
 # every later cycle on exit 3 forever. Unknown last-run is treated as stale so the
 # operator hears once; the next real run restamps and self-heals. A missing file is first
 # run / never armed — was_stale stays 0; a failed first write is caught as state_unarmed.
-# [LAW:types-are-the-program]
+# Host clock: launchd lives on the Mac. [LAW:types-are-the-program]
 was_stale=0
 if [[ -f "$STATE_FILE" ]]; then
   last=$(cat "$STATE_FILE" 2>/dev/null) || last=""
   if [[ "$last" =~ ^[0-9]+$ ]]; then
-    gap_h=$(( (NOW - last) / 3600 ))
+    gap_h=$(( (NOW_HOST - last) / 3600 ))
     if [[ "$gap_h" -gt "$STALE_HOURS" ]]; then
       was_stale=1
       warn "STALE: last run was ${gap_h}h ago (threshold ${STALE_HOURS}h) — the agent was not running. Check: launchctl print gui/\$(id -u)/com.hhouse.ci-janitor"
@@ -404,7 +421,7 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
   state_dir=$(dirname "$STATE_FILE")
   state_tmp="${STATE_FILE}.tmp.$$"
   if mkdir -p "$state_dir" \
-    && printf '%s' "$NOW" > "$state_tmp" \
+    && printf '%s' "$NOW_HOST" > "$state_tmp" \
     && mv -f "$state_tmp" "$STATE_FILE"
   then
     :
