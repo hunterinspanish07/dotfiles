@@ -78,11 +78,12 @@
 # EXIT CODES (a contract, per the CLI binding — each a distinct, actionable outcome):
 #   0  ran clean — swept what was there (or there was nothing), disk healthy
 #   2  the janitor could not run at all (Docker/Colima unreachable) — NOT "all clean"
-#   3  a removal failed, an age could not be determined, OR the staleness clock could
-#      not be armed after a clean sweep — the run did not fully succeed
+#   3  the run did not fully succeed — a removal/age failed, the staleness clock could
+#      not be armed, OR the high-water check could not measure the disk (notify names which)
 #   4  swept clean, but the disk is STILL above the high-water mark — something is
 #      accumulating that these sweeps do not cover; investigate by hand
 #   5  the janitor had not run for far longer than its schedule — it was silently dead
+#      (the stale shout also fires on exit 4 when both apply; see outcome block)
 #  64  usage error (unrecognized argument), per sysexits EX_USAGE. Deliberately the one
 #      non-zero exit that does NOT notify: it is reachable only by typing the command
 #      wrong at a terminal, where the stderr line is already in front of you. A desktop
@@ -158,17 +159,23 @@ mkdir -p "$(dirname "$LOG_FILE")" || {
   exit 2
 }
 
-# Config that would break the live-job invariant is refused here, not clamped: a silent
-# raise-to-floor would let an operator believe they set 1h while the script ran 7h, and
-# a silent proceed would kill live job containers. Fail loud; fix the env. [LAW:no-silent-failure]
+# Config that would break a safety/monitoring invariant is refused here, not clamped:
+# a silent raise-to-floor would lie about what ran; a silent proceed would disable an
+# alarm or kill live job containers. Fail loud; fix the env. [LAW:no-silent-failure]
+# [LAW:types-are-the-program]
 [[ "$AGE_HOURS" =~ ^[1-9][0-9]*$ ]] \
   || die "CI_JANITOR_AGE_HOURS must be a positive integer (got '$AGE_HOURS')"
 [[ "$AGE_HOURS" -ge "$AGE_HOURS_MIN" ]] \
   || die "CI_JANITOR_AGE_HOURS=$AGE_HOURS is below the live-job safety floor of ${AGE_HOURS_MIN}h (platform job ceiling is 6h) — refuse to run a destructive sweep under a false safety invariant"
+[[ "$DISK_WARN_PCT" =~ ^[1-9][0-9]*$ && "$DISK_WARN_PCT" -ge 1 && "$DISK_WARN_PCT" -le 99 ]] \
+  || die "CI_JANITOR_DISK_WARN_PCT must be an integer 1-99 (got '$DISK_WARN_PCT') — out-of-range mutes the high-water alarm"
+[[ "$STALE_HOURS" =~ ^[1-9][0-9]*$ ]] \
+  || die "CI_JANITOR_STALE_HOURS must be a positive integer (got '$STALE_HOURS') — garbage mutes the dead-agent alarm"
 
-incomplete=0   # something could not be removed or could not be aged — sweep is partial
-reclaimed=0    # count of objects actually removed (or that a dry run would remove)
-state_unarmed=0  # clean sweep finished but the staleness clock could not be written
+incomplete=0      # something could not be removed or could not be aged — sweep is partial
+reclaimed=0       # count of objects actually removed (or that a dry run would remove)
+state_unarmed=0   # clean sweep finished but the staleness clock could not be written
+disk_unmeasured=0 # clean sweep finished but the high-water check could not read the disk
 
 # --- helpers ------------------------------------------------------------------
 # Docker stamps three shapes: '2026-07-14T08:22:33-05:00' (volumes),
@@ -355,17 +362,19 @@ if df_out=$(colima ssh -- df -P "$DOCKER_DISK" 2>/dev/null); then
   disk_pct=$(printf '%s\n' "$df_out" | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
 fi
 if [[ ! "$disk_pct" =~ ^[0-9]+$ ]]; then
-  # Never treat an unmeasurable disk as a healthy one.
+  # Never treat an unmeasurable disk as a healthy one — and never launder this into
+  # "something could not be swept". Same split as state_unarmed. [LAW:types-are-the-program]
   warn "could not read usage of $DOCKER_DISK via colima; the high-water check did not run this cycle"
-  incomplete=1
+  disk_unmeasured=1
   disk_pct=""
 else
   log "docker disk ${DOCKER_DISK} is ${disk_pct}% used (high-water ${DISK_WARN_PCT}%)"
 fi
 
-# Record the run only when it actually completed, so the staleness check measures
-# successful runs rather than mere invocations. A dry run is a rehearsal and must not
-# reset the clock. [LAW:one-source-of-truth]
+# Record the run only when the sweeps actually completed, so the staleness check measures
+# "the agent ran its job" rather than mere invocations. A dry run is a rehearsal and must
+# not reset the clock. High-water / unmeasured-disk outcomes do not block the restamp:
+# the agent *did* run; what failed is a different check. [LAW:one-source-of-truth]
 #
 # Atomic replace (temp + mv): `>` truncates on open, so a failed mid-write would destroy
 # the previous good stamp and leave an empty file — which the read side then treats as
@@ -391,7 +400,18 @@ fi
 # --- outcome ------------------------------------------------------------------
 # Precedence, most-severe first; each code is a different thing for you to do.
 # [LAW:types-are-the-program]
+#
+# Stale is shouted whenever it was detected, not only on the exit-5 arm. Exit 4
+# (high-water) used to win the cascade after the restamp had already cleared the
+# latch — so dead-agent + full-disk (exactly the scenario staleness exists to catch)
+# notified only about disk, and the next cycle saw a fresh stamp. The exit code still
+# prefers the more severe outcome; the notify channel carries every alarm that fired.
+# [LAW:no-silent-failure]
 log "done${mode_note}: ${reclaimed} object(s) $([[ "$DRY_RUN" -ne 0 ]] && echo 'would be removed' || echo 'removed')"
+
+if [[ "$was_stale" -ne 0 ]]; then
+  notify "CI janitor had NOT run in over ${STALE_HOURS}h — the agent was down. It ran now; check the schedule."
+fi
 
 if [[ "$incomplete" -ne 0 ]]; then
   warn "INCOMPLETE: at least one object could not be removed or aged — garbage may still be accumulating"
@@ -406,13 +426,17 @@ if [[ "$state_unarmed" -ne 0 ]]; then
   notify "CI janitor could not arm its staleness clock. See ${LOG_FILE}."
   exit 3
 fi
+if [[ "$disk_unmeasured" -ne 0 ]]; then
+  warn "DISK UNMEASURED: could not read usage of $DOCKER_DISK — high-water check did not run this cycle"
+  notify "CI janitor could not measure the Docker disk — high-water check skipped. See ${LOG_FILE}."
+  exit 3
+fi
 if [[ -n "$disk_pct" && "$disk_pct" -ge "$DISK_WARN_PCT" ]]; then
   warn "HIGH WATER: ${DOCKER_DISK} still ${disk_pct}% used after a clean sweep — something is accumulating that these sweeps do not cover. Inspect with: docker system df -v"
   notify "CI janitor: disk still ${disk_pct}% after cleaning — something else is filling it. See ${LOG_FILE}."
   exit 4
 fi
 if [[ "$was_stale" -ne 0 ]]; then
-  notify "CI janitor had NOT run in over ${STALE_HOURS}h — the agent was down. It ran now; check the schedule."
   exit 5
 fi
 exit 0

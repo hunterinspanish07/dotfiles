@@ -72,8 +72,10 @@ margin) are refused at startup. A free dial that accepted `1` would make sweep 3
 ## How you find out it broke
 
 Silent accumulation is what caused the original problem, so the janitor is built to be
-loud about its own failure. Every non-zero exit both logs and raises a desktop
-notification. Two checks catch what a sweep-only janitor would miss:
+loud about its own failure. Every non-zero exit from a **run** both logs and raises a
+desktop notification (exit 64 is the deliberate exception — a mistyped flag at a
+terminal, where stderr is already on screen). Two checks catch what a sweep-only
+janitor would miss:
 
 - **High-water check** — fires when the disk is *still* above threshold after a clean
   sweep. This is how you learn something is accumulating from a source these sweeps
@@ -90,9 +92,9 @@ A successful run stays quiet in the notification channel (it always logs). Daily
 |---|---|
 | 0 | Ran clean — swept what was there, disk healthy |
 | 2 | Could not run at all (Docker/Colima unreachable). **Not** "all clean" |
-| 3 | Sweep incomplete (a removal/age failed), **or** the staleness clock could not be armed after a clean sweep |
+| 3 | Run did not fully succeed — removal/age failed, staleness clock unarmed, **or** Docker disk unmeasurable (notify names which) |
 | 4 | Swept clean, but disk is **still** above the high-water mark — investigate |
-| 5 | Hadn't run for far longer than its schedule — it was silently dead |
+| 5 | Hadn't run for far longer than its schedule — it was silently dead (stale is also notified on exit 4 when both fire) |
 | 64 | Usage error (unrecognized argument) — the one non-zero exit that deliberately does **not** notify: you can only reach it by mistyping the command at a terminal, where the stderr line is already in front of you |
 
 This table mirrors the `EXIT CODES` block at the top of `ci-janitor.sh`; change both together.
@@ -125,8 +127,8 @@ All optional; the defaults are the tested ones.
 | Variable | Default | What it controls |
 |---|---|---|
 | `CI_JANITOR_AGE_HOURS` | `24` | Age floor. Nothing younger is touched, ever. **Minimum 7** (refused below that) |
-| `CI_JANITOR_DISK_WARN_PCT` | `85` | High-water mark for the post-sweep check |
-| `CI_JANITOR_STALE_HOURS` | `72` | How long silence means the agent died |
+| `CI_JANITOR_DISK_WARN_PCT` | `85` | High-water mark for the post-sweep check. **Integer 1–99** (refused outside) |
+| `CI_JANITOR_STALE_HOURS` | `72` | How long silence means the agent died. **Positive integer** (refused otherwise) |
 | `CI_JANITOR_LOG` | `~/.local/share/ci-janitor/janitor.log` | Log path |
 | `CI_JANITOR_STATE` | `~/.local/share/ci-janitor/last-run` | Last successful run stamp |
 | `CI_JANITOR_DOCKER_DISK` | `/var/lib/docker` | Filesystem the high-water check reads |
