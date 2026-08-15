@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# ocremote — one-word control plane for opencode serve + telegram bridge.
+#
+# Usage:
+#   ocremote              # status
+#   ocremote start|stop|restart|status
+#   ocremote logs [-f] [serve|bot|launchd|all]
+#   ocremote install|uninstall
+#
+# launchd is the lifecycle owner; this CLI is the only human seam.
+# [LAW:single-enforcer] [LAW:decomposition]
+set -euo pipefail
+
+LABEL="com.hhouse.opencode-remote"
+DOMAIN="gui/$(id -u)"
+SERVICE="$DOMAIN/$LABEL"
+APP_HOME="${OPENCODE_TG_HOME:-$HOME/Library/Application Support/opencode-telegram-bot}"
+LOG_DIR="$APP_HOME/logs"
+ENV_FILE="$APP_HOME/.env"
+RUNTIME_DIR="$HOME/.config/opencode-remote"
+RUNTIME="$RUNTIME_DIR/remote-launch.sh"
+PLIST_LINK="$HOME/Library/LaunchAgents/${LABEL}.plist"
+PLIST_SRC="$RUNTIME_DIR/${LABEL}.plist"
+
+die() { echo "ocremote: $*" >&2; exit 1; }
+info() { echo "ocremote: $*"; }
+
+api_url() {
+  local url="http://127.0.0.1:4096"
+  if [[ -f "$ENV_FILE" ]]; then
+    local from_env
+    from_env=$(grep -E '^OPENCODE_API_URL=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'") || true
+    [[ -n "${from_env:-}" ]] && url="$from_env"
+  fi
+  printf '%s' "$url"
+}
+
+health_url() { printf '%s/config' "$(api_url | sed 's#/$##')"; }
+
+serve_healthy() {
+  curl -sf --max-time 2 "$(health_url)" >/dev/null 2>&1
+}
+
+agent_loaded() {
+  launchctl print "$SERVICE" >/dev/null 2>&1
+}
+
+agent_state() {
+  # "state = running" / "state = not running" / transient "SIGTERMed" during teardown.
+  launchctl print "$SERVICE" 2>/dev/null | awk -F'= ' '/state =/ {print $2; exit}' || echo "unloaded"
+}
+
+bot_procs() {
+  # Match the bot binary / package, not this script's own argv text.
+  pgrep -f '/opencode-telegram( |$)|@grinev/opencode-telegram-bot' 2>/dev/null || true
+}
+
+stack_procs() {
+  # Unit members: caffeinate wrapper from remote-launch, serve child, bot.
+  pgrep -f 'remote-launch\.sh|caffeinate -s bash -c|/opencode-telegram( |$)|@grinev/opencode-telegram-bot' 2>/dev/null || true
+}
+
+bot_is_up() {
+  [[ -n "$(bot_procs)" ]]
+}
+
+require_runtime() {
+  [[ -e "$RUNTIME" ]] || die "$RUNTIME missing — run './install' from the dotfiles root, then: ocremote install"
+  [[ -e "$PLIST_SRC" ]] || die "$PLIST_SRC missing — re-run dotfiles './install'"
+}
+
+cmd_status() {
+  local api state serve_line bot_line
+  api=$(api_url)
+  if agent_loaded; then
+    state=$(agent_state)
+  else
+    state="unloaded"
+  fi
+
+  if serve_healthy; then
+    serve_line="serve     up    $api"
+  else
+    serve_line="serve     down  $api"
+  fi
+
+  # Bot under launchd runs in the foreground (not --daemon), so the bot CLI's
+  # "Service status" is the wrong map. Prefer process truth; fall back to daemon
+  # status only when we are not the supervisor. [LAW:one-source-of-truth]
+  local bot_up=0
+  if bot_is_up; then
+    bot_line="bot       up      (launchd-managed)"
+    bot_up=1
+  elif command -v opencode-telegram >/dev/null 2>&1; then
+    local daemon_line
+    daemon_line=$(opencode-telegram status 2>&1 | head -1 | sed 's/^Service status: //')
+    bot_line="bot       $daemon_line"
+    [[ "$daemon_line" == *"running"* ]] && bot_up=1
+  else
+    bot_line="bot       opencode-telegram not on PATH"
+  fi
+
+  printf 'agent     %s  (%s)\n' "$state" "$LABEL"
+  printf '%s\n' "$serve_line"
+  printf '%s\n' "$bot_line"
+  printf 'logs      %s\n' "$LOG_DIR"
+
+  # Non-zero when the stack is not fully up — scripts can branch on it.
+  # [LAW:verifiable-goals]
+  if [[ "$state" == "running" ]] && serve_healthy && [[ "$bot_up" -eq 1 ]]; then
+    return 0
+  fi
+  return 1
+}
+
+cmd_start() {
+  require_runtime
+  command -v opencode >/dev/null || die "opencode not on PATH"
+  command -v opencode-telegram >/dev/null || die "opencode-telegram not on PATH"
+  [[ -f "$ENV_FILE" ]] || die "bot config missing: $ENV_FILE (run: opencode-telegram config)"
+
+  mkdir -p "$LOG_DIR" "$HOME/Library/LaunchAgents"
+  ln -sf "$PLIST_SRC" "$PLIST_LINK"
+
+  if agent_loaded; then
+    local state
+    state=$(agent_state)
+    if [[ "$state" == "running" ]] && serve_healthy; then
+      info "already running"
+      cmd_status || true
+      return 0
+    fi
+    # Kick a fresh run of the unit. [LAW:no-silent-failure] surfaces via status after.
+    launchctl kickstart -k "$SERVICE"
+  else
+    launchctl bootstrap "$DOMAIN" "$PLIST_LINK"
+    launchctl enable "$SERVICE" 2>/dev/null || true
+    launchctl kickstart -k "$SERVICE"
+  fi
+
+  # Wait for the whole unit: agent running + serve healthy + bot process live.
+  # [LAW:no-ambient-temporal-coupling] [LAW:verifiable-goals]
+  local i state
+  for i in $(seq 1 45); do
+    state=$(agent_state)
+    if [[ "$state" == "running" ]] && serve_healthy && bot_is_up; then
+      info "started"
+      cmd_status || true
+      return 0
+    fi
+    # If the agent unloaded itself, fail fast instead of spinning. [LAW:no-silent-failure]
+    if ! agent_loaded && [[ "$i" -gt 3 ]]; then
+      break
+    fi
+    sleep 1
+  done
+  echo "ocremote: start timed out — last status:" >&2
+  cmd_status || true
+  echo "ocremote: see $LOG_DIR/launchd.err.log , $LOG_DIR/serve.log , $LOG_DIR/bot.log" >&2
+  exit 1
+}
+
+cmd_stop() {
+  if agent_loaded; then
+    launchctl bootout "$SERVICE" 2>/dev/null || true
+  fi
+  # Best-effort: bot daemon stop is idempotent (no-op when we supervised foreground).
+  if command -v opencode-telegram >/dev/null 2>&1; then
+    opencode-telegram stop >/dev/null 2>&1 || true
+  fi
+
+  # bootout is not always synchronous — wait, then SIGTERM stragglers, then SIGKILL.
+  # Never leave a half-dead unit that status would lie about. [LAW:no-silent-failure]
+  local i pids
+  for i in $(seq 1 15); do
+    pids=$(stack_procs)
+    [[ -z "$pids" ]] && break
+    if [[ "$i" -le 10 ]]; then
+      # shellcheck disable=SC2086
+      kill $pids 2>/dev/null || true
+    else
+      # shellcheck disable=SC2086
+      kill -9 $pids 2>/dev/null || true
+    fi
+    sleep 0.3
+  done
+
+  if [[ -n "$(stack_procs)" ]]; then
+    die "stop incomplete — still running: $(stack_procs | tr '\n' ' ')"
+  fi
+  if agent_loaded; then
+    die "stop incomplete — launchd still has $LABEL loaded"
+  fi
+  info "stopped"
+  cmd_status || true
+}
+
+cmd_restart() {
+  cmd_stop || true
+  cmd_start
+}
+
+cmd_logs() {
+  local follow=0 target=all
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--follow) follow=1; shift ;;
+      serve|bot|launchd|all) target=$1; shift ;;
+      *) die "unknown logs arg: $1 (want: [-f] serve|bot|launchd|all)" ;;
+    esac
+  done
+  mkdir -p "$LOG_DIR"
+  local files=()
+  case "$target" in
+    serve) files+=("$LOG_DIR/serve.log") ;;
+    bot) files+=("$LOG_DIR/bot.log") ;;
+    launchd) files+=("$LOG_DIR/launchd.out.log" "$LOG_DIR/launchd.err.log") ;;
+    all) files+=("$LOG_DIR/serve.log" "$LOG_DIR/bot.log" "$LOG_DIR/launchd.out.log" "$LOG_DIR/launchd.err.log") ;;
+  esac
+  # Touch so tail -F has something to watch on a fresh machine.
+  local f
+  for f in "${files[@]}"; do
+    [[ -f "$f" ]] || : >"$f"
+  done
+  if [[ "$follow" -eq 1 ]]; then
+    tail -F "${files[@]}"
+  else
+    tail -n 40 "${files[@]}"
+  fi
+}
+
+cmd_install() {
+  require_runtime
+  local installer="$RUNTIME_DIR/install.sh"
+  [[ -x "$installer" || -f "$installer" ]] || die "missing $installer"
+  bash "$installer"
+}
+
+cmd_uninstall() {
+  if agent_loaded; then
+    launchctl bootout "$SERVICE" || true
+  fi
+  launchctl disable "$SERVICE" 2>/dev/null || true
+  # Remove only our symlink; never delete a real unrelated plist. [LAW:no-silent-failure]
+  if [[ -L "$PLIST_LINK" ]]; then
+    rm -f "$PLIST_LINK"
+  elif [[ -e "$PLIST_LINK" ]]; then
+    die "$PLIST_LINK exists and is not a symlink — refuse to delete; remove by hand if intended"
+  fi
+  if command -v opencode-telegram >/dev/null 2>&1; then
+    opencode-telegram stop 2>/dev/null || true
+  fi
+  info "uninstalled $LABEL"
+}
+
+cmd_help() {
+  cat <<'EOF'
+ocremote — opencode serve + telegram bridge
+
+  ocremote              status
+  ocremote start        start the stack (launchd-supervised)
+  ocremote stop         stop the stack
+  ocremote restart      stop then start
+  ocremote status       agent / serve / bot
+  ocremote logs [-f] [serve|bot|launchd|all]
+  ocremote install      always-on at login (RunAtLoad + KeepAlive)
+  ocremote uninstall    disable and unload
+
+Requires: opencode, opencode-telegram, and a configured bot
+  (opencode-telegram config → OPENCODE_API_URL in the bot .env).
+EOF
+}
+
+main() {
+  local cmd=${1:-status}
+  shift || true
+  case "$cmd" in
+    start) cmd_start "$@" ;;
+    stop) cmd_stop "$@" ;;
+    restart) cmd_restart "$@" ;;
+    status) cmd_status "$@" ;;
+    logs) cmd_logs "$@" ;;
+    install) cmd_install "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    -h|--help|help) cmd_help ;;
+    *) die "unknown command: $cmd (try: ocremote help)" ;;
+  esac
+}
+
+main "$@"

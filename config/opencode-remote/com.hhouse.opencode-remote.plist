@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LaunchAgent: opencode serve + telegram bridge as one supervised unit.
+     Human seam is `ocremote` (start/stop/status/logs/install). Do not launchctl by hand
+     unless debugging — the CLI is the single enforcer. [LAW:single-enforcer]
+     Install: ocremote install   |   Uninstall: ocremote uninstall -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hhouse.opencode-remote</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/hhouse/.config/opencode-remote/remote-launch.sh</string>
+  </array>
+
+  <!-- launchd hands agents a bare PATH; opencode + opencode-telegram are Homebrew. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>/Users/hhouse</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Restart the whole unit if the bridge dies. remote-launch tears serve down on exit. -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/hhouse/Library/Application Support/opencode-telegram-bot/logs/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/hhouse/Library/Application Support/opencode-telegram-bot/logs/launchd.err.log</string>
+</dict>
+</plist>
