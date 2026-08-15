@@ -63,9 +63,9 @@
 #
 # HOW YOU FIND OUT IT BROKE
 # The whole point of this script is that silent accumulation is what hurt. So it is
-# built to be loud about its own failure: every non-zero exit both logs and raises a
-# desktop notification, and two independent checks catch the failure modes that a
-# sweep-only janitor would miss —
+# built to be loud about its own failure: every non-zero exit from a RUN both logs and
+# raises a desktop notification, and two independent checks catch the failure modes that
+# a sweep-only janitor would miss —
 #   * the post-sweep high-water check fires when the disk is STILL above threshold
 #     after a clean sweep, which is how you learn something is accumulating from a
 #     source these three sweeps don't cover;
@@ -82,6 +82,12 @@
 #   4  swept clean, but the disk is STILL above the high-water mark — something is
 #      accumulating that these sweeps do not cover; investigate by hand
 #   5  the janitor had not run for far longer than its schedule — it was silently dead
+#  64  usage error (unrecognized argument), per sysexits EX_USAGE. Deliberately the one
+#      non-zero exit that does NOT notify: it is reachable only by typing the command
+#      wrong at a terminal, where the stderr line is already in front of you. A desktop
+#      alert for a typo is noise in the channel the alarms above have to travel down.
+# README.md mirrors this table for human readers; change both together.
+# [LAW:one-source-of-truth]
 set -euo pipefail
 
 # --- configuration ------------------------------------------------------------
@@ -114,8 +120,10 @@ for arg in "$@"; do
   esac
 done
 
-mkdir -p "$(dirname "$LOG_FILE")"
-
+# The reporting channel is defined BEFORE anything that can fail, so there is no window
+# in which the script can die without a voice. `printf | tee` also means every message
+# reaches stdout (launchd.out) whether or not the log file itself is writable.
+#
 # `|| true` on the tee only: a logging effect that fails (unwritable log, full disk —
 # both plausible for THIS script in particular) must never abort the run under errexit
 # and skip the sweep that would have fixed it. The isolation is the log's, not the
@@ -129,6 +137,17 @@ notify() {
 # Docker being unreachable is the janitor failing, not the disk being clean. Reporting
 # success here is the silent-fallback trap this script exists to prevent. [LAW:no-silent-failure]
 die() { warn "FATAL: $*"; notify "CI janitor COULD NOT RUN — $1. See ${LOG_FILE}."; exit 2; }
+
+# Losing the log directory means going blind, so it cannot be the one failure that passes
+# unannounced. Unguarded under errexit this exits with only bash's own terse stderr line,
+# which on the launchd path lands in launchd.err and nowhere a person looks. Reported
+# through notify() instead — which needs no log file at all — and pointing at the
+# directory rather than at the log it could not create. [LAW:no-silent-failure]
+mkdir -p "$(dirname "$LOG_FILE")" || {
+  warn "FATAL: cannot create log directory $(dirname "$LOG_FILE") — refusing to run blind"
+  notify "CI janitor COULD NOT RUN — its log directory $(dirname "$LOG_FILE") is not creatable."
+  exit 2
+}
 
 incomplete=0   # something could not be removed or could not be aged — sweep is partial
 reclaimed=0    # count of objects actually removed (or that a dry run would remove)

@@ -89,6 +89,9 @@ A successful run stays quiet in the notification channel (it always logs). Daily
 | 3 | A removal failed, or an age couldn't be determined — sweep incomplete |
 | 4 | Swept clean, but disk is **still** above the high-water mark — investigate |
 | 5 | Hadn't run for far longer than its schedule — it was silently dead |
+| 64 | Usage error (unrecognized argument) — the one non-zero exit that deliberately does **not** notify: you can only reach it by mistyping the command at a terminal, where the stderr line is already in front of you |
+
+This table mirrors the `EXIT CODES` block at the top of `ci-janitor.sh`; change both together.
 
 ## Usage
 
