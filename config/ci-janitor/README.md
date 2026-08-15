@@ -45,11 +45,14 @@ volume `supabase_edge_runtime_grounded` as dangling, so a blanket prune **would 
 it**. The 64-hex-name rule cannot match it, because Docker assigns 64-hex names only to
 anonymous volumes — exactly what a CI service container creates.
 
-| Sweep | Positive signature | Why nothing of yours can match |
+| Sweep (order) | Positive signature | Why nothing of yours can match |
 |---|---|---|
-| Anonymous volumes | name is exactly 64 hex chars, dangling, aged | Docker never names a *named* volume that way |
-| Untagged images | `<none>:<none>`, aged | Tagged images are never touched, so nothing re-pulls |
-| Actions networks + their containers | `github_network_<hex>`, aged | A namespace only the Actions runner creates |
+| 1. Actions networks + their containers | `github_network_<hex>`, aged | A namespace only the Actions runner creates |
+| 2. Anonymous volumes | name is exactly 64 hex chars, dangling, aged | Docker never names a *named* volume that way |
+| 3. Untagged images | `<none>:<none>`, aged | Tagged images are never touched, so nothing re-pulls |
+
+Networks/containers run first so the volumes they pin become dangling in the same run
+and high-water sees a true “every eligible object” reclaim.
 
 **Deliberately not swept**, because the risk outweighs the space: tagged-but-unused
 images (deleting them forces multi-GB re-pulls of Supabase versions Grounded pins),

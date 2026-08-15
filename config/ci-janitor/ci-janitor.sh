@@ -37,15 +37,16 @@
 # ANONYMOUS volumes — the exact kind a CI service container creates. The safety is
 # structural, not a name this script has to remember to exclude.
 #
-# The three sweeps, and why each is safe:
-#   1. Anonymous volumes  — name is exactly 64 hex chars AND dangling AND aged.
+# The three sweeps (dependency order — containers before the volumes they pin), and
+# why each is safe:
+#   1. Actions networks   — name matches github_network_<hex>, a namespace only the
+#      + their containers   Actions runner creates, AND aged. Removes an orphaned
+#                           Postgres still squatting a port; releases the anonymous
+#                           volume it pins so the volume sweep can see it as dangling.
+#   2. Anonymous volumes  — name is exactly 64 hex chars AND dangling AND aged.
 #                           No named volume can match; Docker won't name one that way.
-#   2. Untagged images    — <none>:<none> AND aged. Tagged images are never touched,
+#   3. Untagged images    — <none>:<none> AND aged. Tagged images are never touched,
 #                           so no `supabase start` ever re-pulls a pinned version.
-#   3. Actions networks   — name matches github_network_<hex>, a namespace only the
-#      + their containers   Actions runner creates, AND aged. This is what removes an
-#                           orphaned Postgres still squatting a port; it also releases
-#                           the anonymous volume it pins, which sweep 1 then reclaims.
 #
 # Deliberately NOT swept, because the risk outweighs the space: tagged-but-unused
 # images (deleting them forces multi-GB re-pulls of Supabase versions Grounded pins),
@@ -339,47 +340,14 @@ mode_note=""
 [[ "$DRY_RUN" -ne 0 ]] && mode_note=" [DRY RUN — nothing will be deleted]"
 log "start${mode_note}: age floor ${AGE_HOURS}h, disk high-water ${DISK_WARN_PCT}%"
 
-# --- sweep 1: anonymous volumes orphaned by CI service containers -------------
-# Dangling + a 64-hex name. Docker assigns 64-hex names only to ANONYMOUS volumes, so
-# every named volume on this host (supabase_*, actual-data, odysseus_chromadb-data,
-# buildx_*_state) is excluded by the shape of its name and not by a list this script
-# would have to keep in sync with the machine. [LAW:types-are-the-program]
-vols_all=$(docker volume ls --filter dangling=true --format '{{.Name}}') \
-  || die "docker volume ls failed"
-vols=$(match_or_empty '^[0-9a-f]{64}$' "$vols_all") \
-  || die "grep failed (rc=$?) filtering volume names — cannot tell garbage from live data"
-if [[ -n "$vols" ]]; then
-  while read -r v; do
-    [[ -z "$v" ]] && continue
-    created=$(docker volume inspect "$v" --format '{{.CreatedAt}}' 2>/dev/null) || {
-      warn "skip: could not inspect volume $v; keeping it (run is incomplete)"
-      incomplete=1
-      continue
-    }
-    is_old_enough "$created" "volume $v" || continue
-    remove_one "volume" "$v (created ${created:0:10})" docker volume rm "$v"
-  done <<< "$vols"
-fi
-
-# --- sweep 2: untagged images -------------------------------------------------
-# <none>:<none> only. Every tagged image survives, so nothing Grounded or Odyssey pins
-# is ever re-pulled because of this script.
-imgs=$(docker images --filter dangling=true --format '{{.ID}}|{{.CreatedAt}}') \
-  || die "docker images failed"
-if [[ -n "$imgs" ]]; then
-  while IFS='|' read -r id created; do
-    [[ -z "$id" ]] && continue
-    is_old_enough "$created" "image $id" || continue
-    remove_one "image" "$id (created ${created:0:10})" docker rmi "$id"
-  done <<< "$imgs"
-fi
-
-# --- sweep 3: orphaned Actions networks, and the containers still on them ------
+# --- sweep 1: orphaned Actions networks, and the containers still on them ------
+# FIRST: containers pin anonymous volumes. Until they are removed, those volumes are
+# not dangling and the volume sweep cannot see them. Running volumes before this left
+# GBs on disk and let high-water claim an "outside" source for covered garbage.
+# [LAW:dataflow-not-control-flow]
 # `github_network_<hex>` is a namespace only the Actions runner creates, one per job.
 # A leftover one means a job died without cleaning up. Containers attached to it are
-# that job's service containers — the Postgres that squats a port and pins the
-# anonymous volume sweep 1 wants. They are removed first so the network can go, and so
-# the next run's sweep 1 can reclaim the volume they were holding.
+# that job's service containers — the Postgres that squats a port.
 nets_all=$(docker network ls --format '{{.Name}}') || die "docker network ls failed"
 nets=$(match_or_empty '^github_network_[0-9a-f]+$' "$nets_all") \
   || die "grep failed (rc=$?) filtering network names — cannot tell Actions nets from yours"
@@ -405,6 +373,42 @@ if [[ -n "$nets" ]]; then
     done
     remove_one "network" "$n (created ${created:0:10})" docker network rm "$n"
   done <<< "$nets"
+fi
+
+# --- sweep 2: anonymous volumes orphaned by CI service containers -------------
+# AFTER containers: only then are the volumes dangling. Dangling + a 64-hex name.
+# Docker assigns 64-hex names only to ANONYMOUS volumes, so every named volume on this
+# host (supabase_*, actual-data, odysseus_chromadb-data, buildx_*_state) is excluded by
+# the shape of its name and not by a list this script would have to keep in sync with
+# the machine. [LAW:types-are-the-program]
+vols_all=$(docker volume ls --filter dangling=true --format '{{.Name}}') \
+  || die "docker volume ls failed"
+vols=$(match_or_empty '^[0-9a-f]{64}$' "$vols_all") \
+  || die "grep failed (rc=$?) filtering volume names — cannot tell garbage from live data"
+if [[ -n "$vols" ]]; then
+  while read -r v; do
+    [[ -z "$v" ]] && continue
+    created=$(docker volume inspect "$v" --format '{{.CreatedAt}}' 2>/dev/null) || {
+      warn "skip: could not inspect volume $v; keeping it (run is incomplete)"
+      incomplete=1
+      continue
+    }
+    is_old_enough "$created" "volume $v" || continue
+    remove_one "volume" "$v (created ${created:0:10})" docker volume rm "$v"
+  done <<< "$vols"
+fi
+
+# --- sweep 3: untagged images -------------------------------------------------
+# <none>:<none> only. Every tagged image survives, so nothing Grounded or Odyssey pins
+# is ever re-pulled because of this script.
+imgs=$(docker images --filter dangling=true --format '{{.ID}}|{{.CreatedAt}}') \
+  || die "docker images failed"
+if [[ -n "$imgs" ]]; then
+  while IFS='|' read -r id created; do
+    [[ -z "$id" ]] && continue
+    is_old_enough "$created" "image $id" || continue
+    remove_one "image" "$id (created ${created:0:10})" docker rmi "$id"
+  done <<< "$imgs"
 fi
 
 # --- post-sweep high-water check ----------------------------------------------
@@ -483,9 +487,12 @@ elif [[ "$was_stale" -ne 0 ]]; then
   # Log only: dry-run does not arm the stamp, so "It ran now" would be a lie.
   warn "STALE (dry-run): agent had not run in over ${STALE_HOURS}h — notify/exit 5 held; stamp not updated"
 fi
-if [[ "$state_unknown" -ne 0 && "$DRY_RUN" -eq 0 ]]; then
-  # Not exit 5: no gap was measured. Restamp on this run heals it.
+if [[ "$state_unknown" -ne 0 && "$DRY_RUN" -eq 0 && "$state_unarmed" -eq 0 ]]; then
+  # Not exit 5: no gap was measured. Only claim restamped when the write succeeded.
   notify "CI janitor found a malformed last-run stamp — restamped; not a dead-agent signal. See ${LOG_FILE}."
+elif [[ "$state_unknown" -ne 0 && "$DRY_RUN" -eq 0 ]]; then
+  # Write failed: STATE UNARMED notify carries the truth; don't also claim restamped.
+  warn "STATE UNKNOWN: stamp was malformed and could not be rewritten this cycle"
 elif [[ "$state_unknown" -ne 0 ]]; then
   warn "STATE UNKNOWN (dry-run): stamp malformed — notify held; stamp not updated"
 fi
