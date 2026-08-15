@@ -169,11 +169,20 @@ is_old_enough() {
 # grep's exit 1 means "nothing matched" — a legitimate empty result, not an error.
 # Exit 2+ IS an error and must not be laundered into an empty list, which would read as
 # "no garbage found" and quietly stop the janitor doing its job. [LAW:no-silent-failure]
+#
+# So this reports a real grep error the ordinary way — as its OWN exit status — and every
+# caller must pair it with `|| die`. It deliberately does NOT call `die` itself: callers
+# invoke it as `v=$(match_or_empty ...)`, and inside that command substitution `exit`
+# would only end the subshell. Today errexit still catches that (bash gives a bare
+# `var=$(...)` assignment the substitution's status), so the failure is loud by a narrow
+# interpreter rule rather than by design — and one refactor to `local v=$(...)` would
+# silently break it, because `local`'s own exit 0 masks the substitution's status. The
+# status-plus-`|| die` contract is visible at the call site and survives that edit.
 match_or_empty() {
   local pattern="$1" input="$2" out rc
   out=$(printf '%s\n' "$input" | grep -E "$pattern") || {
     rc=$?
-    [[ "$rc" -eq 1 ]] || die "grep failed (rc=$rc) filtering with /$pattern/"
+    [[ "$rc" -eq 1 ]] || return "$rc"
     out=""
   }
   printf '%s' "$out"
@@ -238,7 +247,8 @@ log "start${mode_note}: age floor ${AGE_HOURS}h, disk high-water ${DISK_WARN_PCT
 # would have to keep in sync with the machine. [LAW:types-are-the-program]
 vols_all=$(docker volume ls --filter dangling=true --format '{{.Name}}') \
   || die "docker volume ls failed"
-vols=$(match_or_empty '^[0-9a-f]{64}$' "$vols_all")
+vols=$(match_or_empty '^[0-9a-f]{64}$' "$vols_all") \
+  || die "grep failed (rc=$?) filtering volume names — cannot tell garbage from live data"
 if [[ -n "$vols" ]]; then
   while read -r v; do
     [[ -z "$v" ]] && continue
@@ -272,7 +282,8 @@ fi
 # anonymous volume sweep 1 wants. They are removed first so the network can go, and so
 # the next run's sweep 1 can reclaim the volume they were holding.
 nets_all=$(docker network ls --format '{{.Name}}') || die "docker network ls failed"
-nets=$(match_or_empty '^github_network_[0-9a-f]+$' "$nets_all")
+nets=$(match_or_empty '^github_network_[0-9a-f]+$' "$nets_all") \
+  || die "grep failed (rc=$?) filtering network names — cannot tell Actions nets from yours"
 if [[ -n "$nets" ]]; then
   while read -r n; do
     [[ -z "$n" ]] && continue
