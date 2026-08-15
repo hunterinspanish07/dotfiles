@@ -51,12 +51,21 @@
     # so no shell-config change is needed. Relocate if you keep tools elsewhere.
     ~/go/bin/litmux:
       path: bin/litmux
+    # ocremote — one-word control plane for opencode serve + telegram bridge.
+    # Same ~/go/bin landing zone as litmux. Always-on is optional:
+    #   ocremote install
+    ~/go/bin/ocremote:
+      path: bin/ocremote
     # runner-guard — machine-wide circuit breaker for crash-looping self-hosted CI
     # runners. Links the whole dir so the launchd plist references a stable runtime
     # path (~/.config/runner-guard/runner-guard.sh). Loading the agent is a one-time
     # launchctl step dotbot can't do: run ~/.config/runner-guard/install.sh after link.
     ~/.config/runner-guard:
       path: config/runner-guard
+    # opencode-remote — launchd unit + process owner for the telegram stack.
+    # ocremote is the human seam; this dir is what launchd executes.
+    ~/.config/opencode-remote:
+      path: config/opencode-remote
     # opencode reads the SAME laws as Claude Code. It cannot run Claude Code plugins, so
     # this router plugin ports the behaviour: a system-prompt injection routes to ONE
     # medium each turn, and laws_{code,prompt,prose,ticket} tools return the vendored
