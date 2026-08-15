@@ -295,7 +295,7 @@ if [[ -f "$STATE_FILE" ]]; then
     gap_h=$(( (NOW - last) / 3600 ))
     if [[ "$gap_h" -gt "$STALE_HOURS" ]]; then
       was_stale=1
-      warn "STALE: last successful run was ${gap_h}h ago (threshold ${STALE_HOURS}h) — the agent was not running. Check: launchctl print gui/\$(id -u)/com.hhouse.ci-janitor"
+      warn "STALE: last run was ${gap_h}h ago (threshold ${STALE_HOURS}h) — the agent was not running. Check: launchctl print gui/\$(id -u)/com.hhouse.ci-janitor"
     fi
   else
     warn "state file $STATE_FILE is unreadable or malformed; treating last-run as unknown (will restamp on clean sweep)"
@@ -387,18 +387,20 @@ else
   log "docker disk ${DOCKER_DISK} is ${disk_pct}% used (high-water ${DISK_WARN_PCT}%)"
 fi
 
-# Record the run only when the sweeps actually completed, so the staleness check measures
-# "the agent ran its job" rather than mere invocations. A dry run is a rehearsal and must
-# not reset the clock. High-water / unmeasured-disk outcomes do not block the restamp:
-# the agent *did* run; what failed is a different check. [LAW:one-source-of-truth]
+# Restamp means "the agent ran," not "the sweep was clean." Stale's unique job is
+# detecting silence (launchd unloaded, no notifies at all) while the disk refills.
+# Gating the stamp on incomplete=0 collapsed that into "no fully-clean completion":
+# a stuck volume would fire exit 3 every day *and*, after 72h, permanently false-alarm
+# "agent was down" even though the agent is healthy. Incomplete stays the daily
+# partial-sweep signal; the clock only answers "did the agent show up." A dry run is a
+# rehearsal and must not reset the clock. [LAW:one-source-of-truth]
 #
 # Atomic replace (temp + mv): `>` truncates on open, so a failed mid-write would destroy
 # the previous good stamp and leave an empty file — which the read side then treats as
 # malformed. Soft-noting that failure let the run exit 0 with the silence alarm either
-# permanently stuck (malformed blocked rewrite via incomplete) or never armed (file
-# never created). Write failure is hard: the sweep finished, but the clock that detects
-# a dead agent is unarmed. [LAW:no-silent-failure]
-if [[ "$DRY_RUN" -eq 0 && "$incomplete" -eq 0 ]]; then
+# permanently stuck or never armed. Write failure is hard: the agent ran, but the clock
+# that detects its absence is unarmed. [LAW:no-silent-failure]
+if [[ "$DRY_RUN" -eq 0 ]]; then
   state_dir=$(dirname "$STATE_FILE")
   state_tmp="${STATE_FILE}.tmp.$$"
   if mkdir -p "$state_dir" \
@@ -423,8 +425,12 @@ fi
 # alarm; only the exit code is a single winner. [LAW:no-silent-failure]
 log "done${mode_note}: ${reclaimed} object(s) $([[ "$DRY_RUN" -ne 0 ]] && echo 'would be removed' || echo 'removed')"
 
+# High-water's contract is "disk still high AFTER A CLEAN SWEEP" — look outside these
+# three sweeps. Firing it when incomplete=1 is a false diagnosis: the disk is high
+# because the sweep did not finish. Notify-every-alarm does not extend to an alarm
+# whose definition is conditional on another flag. [LAW:comments-carry-meaning]
 high_water=0
-if [[ -n "$disk_pct" && "$disk_pct" -ge "$DISK_WARN_PCT" ]]; then
+if [[ "$incomplete" -eq 0 && -n "$disk_pct" && "$disk_pct" -ge "$DISK_WARN_PCT" ]]; then
   high_water=1
 fi
 
@@ -436,9 +442,9 @@ if [[ "$incomplete" -ne 0 ]]; then
   notify "CI janitor INCOMPLETE — something could not be swept; disk may still be filling. See ${LOG_FILE}."
 fi
 if [[ "$state_unarmed" -ne 0 ]]; then
-  # Distinct from incomplete: the sweeps finished; the bookkeeping that makes silence
-  # mean "agent dead" did not. [LAW:comments-carry-meaning]
-  warn "STATE UNARMED: sweep finished but could not write $STATE_FILE — the ${STALE_HOURS}h silence check is blind until the next successful write"
+  # Distinct from incomplete: the agent ran; the bookkeeping that makes silence mean
+  # "agent dead" did not. [LAW:comments-carry-meaning]
+  warn "STATE UNARMED: agent ran but could not write $STATE_FILE — the ${STALE_HOURS}h silence check is blind until the next successful write"
   notify "CI janitor could not arm its staleness clock. See ${LOG_FILE}."
 fi
 if [[ "$disk_unmeasured" -ne 0 ]]; then
