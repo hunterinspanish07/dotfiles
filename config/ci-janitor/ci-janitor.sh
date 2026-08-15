@@ -122,8 +122,8 @@ DOCKER_DISK="${CI_JANITOR_DOCKER_DISK:-/var/lib/docker}"
 
 # Read-only mode: classify and report every candidate exactly as a real run would, and
 # hold the deletions. Preserves exit 2 (can't run) and exit 3 from classification /
-# inspect failures. Deliberately does NOT raise exit 4 (high-water needs a real clean
-# sweep) or arm the staleness stamp — those are real-run outcomes.
+# inspect failures. Deliberately does NOT raise exit 4/5, arm the stamp, or shout
+# stale recovery — those are real-run outcomes tied to effects dry-run holds back.
 # [LAW:effects-at-boundaries]
 DRY_RUN=0
 for arg in "$@"; do
@@ -269,11 +269,18 @@ remove_one() {
     reclaimed=$(( reclaimed + 1 ))
     return 0
   fi
-  # An image still referenced by a container is a correct outcome, not a fault: report
-  # it plainly and do not inflate it into a failed sweep.
+  # "in use" is benign only for images/volumes (still referenced by something we keep).
+  # For networks and job containers it means the orphan sweep did not finish — counting
+  # that as success left orphans forever and let the run exit 0. [LAW:types-are-the-program]
   case "$err" in
     *"is being used"*|*"in use"*)
-      log "kept ${what}: ${label} — still in use" ;;
+      case "$what" in
+        image|volume)
+          log "kept ${what}: ${label} — still in use" ;;
+        *)
+          warn "FAILED to remove ${what} ${label}: ${err}"
+          incomplete=1 ;;
+      esac ;;
     *)
       warn "FAILED to remove ${what} ${label}: ${err}"
       incomplete=1 ;;
@@ -377,7 +384,14 @@ if [[ -n "$nets" ]]; then
       continue
     }
     is_old_enough "$created" "network $n" || continue
-    members=$(docker network inspect "$n" --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null) || members=""
+    # Fail closed like every other inspect — empty members from a failed listing would
+    # skip container rm, then network rm "in use" used to be treated as benign success.
+    # [LAW:no-silent-failure]
+    members=$(docker network inspect "$n" --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null) || {
+      warn "skip: could not list members of network $n; keeping it (run is incomplete)"
+      incomplete=1
+      continue
+    }
     for c in $members; do
       remove_one "orphaned job container" "$c (on $n)" docker rm -f "$c"
     done
@@ -452,8 +466,11 @@ if [[ "$DRY_RUN" -eq 0 && "$incomplete" -eq 0 && -n "$disk_pct" && "$disk_pct" -
   high_water=1
 fi
 
-if [[ "$was_stale" -ne 0 ]]; then
+if [[ "$was_stale" -ne 0 && "$DRY_RUN" -eq 0 ]]; then
   notify "CI janitor had NOT run in over ${STALE_HOURS}h — the agent was down. It ran now; check the schedule."
+elif [[ "$was_stale" -ne 0 ]]; then
+  # Log only: dry-run does not arm the stamp, so "It ran now" would be a lie.
+  warn "STALE (dry-run): agent had not run in over ${STALE_HOURS}h — notify/exit 5 held; stamp not updated"
 fi
 if [[ "$incomplete" -ne 0 ]]; then
   warn "INCOMPLETE: at least one object could not be removed or aged — garbage may still be accumulating"
@@ -481,7 +498,7 @@ fi
 if [[ "$high_water" -ne 0 ]]; then
   exit 4
 fi
-if [[ "$was_stale" -ne 0 ]]; then
+if [[ "$was_stale" -ne 0 && "$DRY_RUN" -eq 0 ]]; then
   exit 5
 fi
 exit 0
