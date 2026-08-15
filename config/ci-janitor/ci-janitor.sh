@@ -78,7 +78,8 @@
 # EXIT CODES (a contract, per the CLI binding — each a distinct, actionable outcome):
 #   0  ran clean — swept what was there (or there was nothing), disk healthy
 #   2  the janitor could not run at all (Docker/Colima unreachable) — NOT "all clean"
-#   3  a removal failed, or an age could not be determined, so the sweep is incomplete
+#   3  a removal failed, an age could not be determined, OR the staleness clock could
+#      not be armed after a clean sweep — the run did not fully succeed
 #   4  swept clean, but the disk is STILL above the high-water mark — something is
 #      accumulating that these sweeps do not cover; investigate by hand
 #   5  the janitor had not run for far longer than its schedule — it was silently dead
@@ -94,6 +95,14 @@ set -euo pipefail
 # Nothing younger than this is ever touched, in any sweep. See "HOW 'DON'T TOUCH A
 # LIVE JOB' IS GUARANTEED" above — this single number is that guarantee, so it has one
 # home and every sweep reads it. [LAW:one-source-of-truth]
+#
+# AGE_HOURS_MIN is the live-job safety floor made unrepresentable-to-violate: the
+# platform's own job ceiling is 6h, so anything below 7h would make sweep 3's
+# `docker rm -f` eligible to kill service containers still attached to an in-progress
+# job. Validated (not clamped) after `die` exists — a misconfigured floor refuses to
+# run rather than executing a destructive sweep under a false safety invariant.
+# [LAW:types-are-the-program] [LAW:no-silent-failure]
+AGE_HOURS_MIN=7
 AGE_HOURS="${CI_JANITOR_AGE_HOURS:-24}"
 # Percent-used of the Docker disk above which a post-sweep run is considered a failure
 # to keep up, not a success. 85 leaves real headroom on the 98 GB volume: the Playwright
@@ -149,8 +158,17 @@ mkdir -p "$(dirname "$LOG_FILE")" || {
   exit 2
 }
 
+# Config that would break the live-job invariant is refused here, not clamped: a silent
+# raise-to-floor would let an operator believe they set 1h while the script ran 7h, and
+# a silent proceed would kill live job containers. Fail loud; fix the env. [LAW:no-silent-failure]
+[[ "$AGE_HOURS" =~ ^[1-9][0-9]*$ ]] \
+  || die "CI_JANITOR_AGE_HOURS must be a positive integer (got '$AGE_HOURS')"
+[[ "$AGE_HOURS" -ge "$AGE_HOURS_MIN" ]] \
+  || die "CI_JANITOR_AGE_HOURS=$AGE_HOURS is below the live-job safety floor of ${AGE_HOURS_MIN}h (platform job ceiling is 6h) — refuse to run a destructive sweep under a false safety invariant"
+
 incomplete=0   # something could not be removed or could not be aged — sweep is partial
 reclaimed=0    # count of objects actually removed (or that a dry run would remove)
+state_unarmed=0  # clean sweep finished but the staleness clock could not be written
 
 # --- helpers ------------------------------------------------------------------
 # Docker stamps three shapes: '2026-07-14T08:22:33-05:00' (volumes),
@@ -240,9 +258,16 @@ docker info >/dev/null 2>&1 || die "Docker daemon unreachable (is Colima up? 'co
 # Did the janitor itself stop running? Only detectable once it runs again after a gap,
 # but that is precisely the case worth catching: an agent silently unloaded for weeks
 # while the disk refilled. [LAW:no-silent-failure]
+#
+# Malformed/unreadable is NOT folded into `incomplete`: that both mis-labels the failure
+# (no object failed to sweep) and blocks the rewrite that would heal the stamp, locking
+# every later cycle on exit 3 forever. Unknown last-run is treated as stale so the
+# operator hears once; a clean sweep restamps and self-heals. A missing file is first
+# run / never armed — was_stale stays 0; a failed first write is caught as state_unarmed.
+# [LAW:types-are-the-program]
 was_stale=0
 if [[ -f "$STATE_FILE" ]]; then
-  last=$(cat "$STATE_FILE") || last=""
+  last=$(cat "$STATE_FILE" 2>/dev/null) || last=""
   if [[ "$last" =~ ^[0-9]+$ ]]; then
     gap_h=$(( (NOW - last) / 3600 ))
     if [[ "$gap_h" -gt "$STALE_HOURS" ]]; then
@@ -250,8 +275,8 @@ if [[ -f "$STATE_FILE" ]]; then
       warn "STALE: last successful run was ${gap_h}h ago (threshold ${STALE_HOURS}h) — the agent was not running. Check: launchctl print gui/\$(id -u)/com.hhouse.ci-janitor"
     fi
   else
-    warn "state file $STATE_FILE is unreadable or malformed; cannot tell when the janitor last ran"
-    incomplete=1
+    warn "state file $STATE_FILE is unreadable or malformed; treating last-run as unknown (will restamp on clean sweep)"
+    was_stale=1
   fi
 fi
 
@@ -341,8 +366,26 @@ fi
 # Record the run only when it actually completed, so the staleness check measures
 # successful runs rather than mere invocations. A dry run is a rehearsal and must not
 # reset the clock. [LAW:one-source-of-truth]
+#
+# Atomic replace (temp + mv): `>` truncates on open, so a failed mid-write would destroy
+# the previous good stamp and leave an empty file — which the read side then treats as
+# malformed. Soft-noting that failure let the run exit 0 with the silence alarm either
+# permanently stuck (malformed blocked rewrite via incomplete) or never armed (file
+# never created). Write failure is hard: the sweep finished, but the clock that detects
+# a dead agent is unarmed. [LAW:no-silent-failure]
 if [[ "$DRY_RUN" -eq 0 && "$incomplete" -eq 0 ]]; then
-  printf '%s' "$NOW" > "$STATE_FILE" || warn "note: could not write state file $STATE_FILE"
+  state_dir=$(dirname "$STATE_FILE")
+  state_tmp="${STATE_FILE}.tmp.$$"
+  if mkdir -p "$state_dir" \
+    && printf '%s' "$NOW" > "$state_tmp" \
+    && mv -f "$state_tmp" "$STATE_FILE"
+  then
+    :
+  else
+    rm -f "$state_tmp" 2>/dev/null || true
+    warn "could not write state file $STATE_FILE — staleness check is unarmed this cycle"
+    state_unarmed=1
+  fi
 fi
 
 # --- outcome ------------------------------------------------------------------
@@ -353,6 +396,14 @@ log "done${mode_note}: ${reclaimed} object(s) $([[ "$DRY_RUN" -ne 0 ]] && echo '
 if [[ "$incomplete" -ne 0 ]]; then
   warn "INCOMPLETE: at least one object could not be removed or aged — garbage may still be accumulating"
   notify "CI janitor INCOMPLETE — something could not be swept; disk may still be filling. See ${LOG_FILE}."
+  exit 3
+fi
+if [[ "$state_unarmed" -ne 0 ]]; then
+  # Distinct from incomplete: the sweeps finished; the bookkeeping that makes silence
+  # mean "agent dead" did not. Same exit family (3) so the channel stays one alarm, but
+  # the message names the real fault. [LAW:comments-carry-meaning]
+  warn "STATE UNARMED: sweep finished but could not write $STATE_FILE — the ${STALE_HOURS}h silence check is blind until the next successful write"
+  notify "CI janitor could not arm its staleness clock. See ${LOG_FILE}."
   exit 3
 fi
 if [[ -n "$disk_pct" && "$disk_pct" -ge "$DISK_WARN_PCT" ]]; then

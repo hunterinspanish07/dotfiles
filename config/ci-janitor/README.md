@@ -65,6 +65,10 @@ floor is the guarantee**: nothing younger than `CI_JANITOR_AGE_HOURS` (default 2
 ever touched, in any sweep. Jobs on this host take 1–2 minutes and the platform ceiling
 is 6 hours, so nothing the janitor can see could belong to a job still running.
 
+The floor is enforced, not just documented: values below **7h** (platform ceiling + 1h
+margin) are refused at startup. A free dial that accepted `1` would make sweep 3's
+`docker rm -f` eligible to kill service containers still on an in-progress job.
+
 ## How you find out it broke
 
 Silent accumulation is what caused the original problem, so the janitor is built to be
@@ -86,7 +90,7 @@ A successful run stays quiet in the notification channel (it always logs). Daily
 |---|---|
 | 0 | Ran clean — swept what was there, disk healthy |
 | 2 | Could not run at all (Docker/Colima unreachable). **Not** "all clean" |
-| 3 | A removal failed, or an age couldn't be determined — sweep incomplete |
+| 3 | Sweep incomplete (a removal/age failed), **or** the staleness clock could not be armed after a clean sweep |
 | 4 | Swept clean, but disk is **still** above the high-water mark — investigate |
 | 5 | Hadn't run for far longer than its schedule — it was silently dead |
 | 64 | Usage error (unrecognized argument) — the one non-zero exit that deliberately does **not** notify: you can only reach it by mistyping the command at a terminal, where the stderr line is already in front of you |
@@ -120,7 +124,7 @@ All optional; the defaults are the tested ones.
 
 | Variable | Default | What it controls |
 |---|---|---|
-| `CI_JANITOR_AGE_HOURS` | `24` | Age floor. Nothing younger is touched, ever |
+| `CI_JANITOR_AGE_HOURS` | `24` | Age floor. Nothing younger is touched, ever. **Minimum 7** (refused below that) |
 | `CI_JANITOR_DISK_WARN_PCT` | `85` | High-water mark for the post-sweep check |
 | `CI_JANITOR_STALE_HOURS` | `72` | How long silence means the agent died |
 | `CI_JANITOR_LOG` | `~/.local/share/ci-janitor/janitor.log` | Log path |
