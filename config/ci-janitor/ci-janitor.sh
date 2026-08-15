@@ -180,12 +180,28 @@ disk_unmeasured=0 # clean sweep finished but the high-water check could not read
 # --- helpers ------------------------------------------------------------------
 # Docker stamps three shapes: '2026-07-14T08:22:33-05:00' (volumes),
 # '2026-08-04 19:39:08 -0500 CDT' (images), and the same with nanoseconds (networks).
-# All three share a 19-char 'YYYY-MM-DD?HH:MM:SS' prefix in LOCAL time, which is
-# exactly what BSD `date -j` parses. Normalising to that prefix reads all three with
-# one rule rather than three parsers. [LAW:one-type-per-behavior]
+# The wall-clock alone is not enough: Colima's daemon TZ can differ from the Mac's,
+# and stripping the offset then re-parsing as host-local makes an object look up to
+# ~12h older/younger than it is — enough to put a live job under the 7h floor.
+# One parser: datetime + offset → epoch. Offset-less / Z → UTC. Fail closed on
+# anything else. [LAW:one-type-per-behavior] [LAW:no-ambient-temporal-coupling]
 epoch_of() {
-  local ts="${1:0:19}"
-  date -j -f '%Y-%m-%d %H:%M:%S' "${ts/T/ }" +%s 2>/dev/null
+  local raw="$1" s datetime offset zflag
+  s="${raw/T/ }"
+  # YYYY-MM-DD HH:MM:SS, optional frac, optional whitespace, then REQUIRED
+  # Z / ±HH:MM / ±HHMM. Trailing junk (e.g. " CDT") is fine. Offset is required:
+  # without it we would be guessing the daemon's clock domain. [LAW:no-silent-failure]
+  if [[ "$s" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}[ ][0-9]{2}:[0-9]{2}:[0-9]{2})(\.[0-9]+)?[[:space:]]*([Zz]|[+-][0-9]{2}:?[0-9]{2}) ]]; then
+    datetime="${BASH_REMATCH[1]}"
+    offset="${BASH_REMATCH[3]}"
+  else
+    return 1
+  fi
+  case "$offset" in
+    Z|z) zflag="+0000" ;;
+    *) zflag="${offset//:/}" ;;  # -05:00 → -0500; -0500 stays
+  esac
+  date -j -f '%Y-%m-%d %H:%M:%S%z' "${datetime}${zflag}" +%s 2>/dev/null
 }
 
 NOW=$(date +%s)
@@ -401,39 +417,44 @@ fi
 # Precedence, most-severe first; each code is a different thing for you to do.
 # [LAW:types-are-the-program]
 #
-# Stale is shouted whenever it was detected, not only on the exit-5 arm. Exit 4
-# (high-water) used to win the cascade after the restamp had already cleared the
-# latch — so dead-agent + full-disk (exactly the scenario staleness exists to catch)
-# notified only about disk, and the next cycle saw a fresh stamp. The exit code still
-# prefers the more severe outcome; the notify channel carries every alarm that fired.
-# [LAW:no-silent-failure]
+# Every alarm that fired is notified, then the exit code picks the most severe.
+# Gating a notify on winning the cascade is how stale+high-water and
+# state_unarmed+high-water each dropped a signal — the channel must carry every
+# alarm; only the exit code is a single winner. [LAW:no-silent-failure]
 log "done${mode_note}: ${reclaimed} object(s) $([[ "$DRY_RUN" -ne 0 ]] && echo 'would be removed' || echo 'removed')"
+
+high_water=0
+if [[ -n "$disk_pct" && "$disk_pct" -ge "$DISK_WARN_PCT" ]]; then
+  high_water=1
+fi
 
 if [[ "$was_stale" -ne 0 ]]; then
   notify "CI janitor had NOT run in over ${STALE_HOURS}h — the agent was down. It ran now; check the schedule."
 fi
-
 if [[ "$incomplete" -ne 0 ]]; then
   warn "INCOMPLETE: at least one object could not be removed or aged — garbage may still be accumulating"
   notify "CI janitor INCOMPLETE — something could not be swept; disk may still be filling. See ${LOG_FILE}."
-  exit 3
 fi
 if [[ "$state_unarmed" -ne 0 ]]; then
   # Distinct from incomplete: the sweeps finished; the bookkeeping that makes silence
-  # mean "agent dead" did not. Same exit family (3) so the channel stays one alarm, but
-  # the message names the real fault. [LAW:comments-carry-meaning]
+  # mean "agent dead" did not. [LAW:comments-carry-meaning]
   warn "STATE UNARMED: sweep finished but could not write $STATE_FILE — the ${STALE_HOURS}h silence check is blind until the next successful write"
   notify "CI janitor could not arm its staleness clock. See ${LOG_FILE}."
-  exit 3
 fi
 if [[ "$disk_unmeasured" -ne 0 ]]; then
   warn "DISK UNMEASURED: could not read usage of $DOCKER_DISK — high-water check did not run this cycle"
   notify "CI janitor could not measure the Docker disk — high-water check skipped. See ${LOG_FILE}."
-  exit 3
 fi
-if [[ -n "$disk_pct" && "$disk_pct" -ge "$DISK_WARN_PCT" ]]; then
+if [[ "$high_water" -ne 0 ]]; then
   warn "HIGH WATER: ${DOCKER_DISK} still ${disk_pct}% used after a clean sweep — something is accumulating that these sweeps do not cover. Inspect with: docker system df -v"
   notify "CI janitor: disk still ${disk_pct}% after cleaning — something else is filling it. See ${LOG_FILE}."
+fi
+
+# Exit precedence, most-severe first. Notifies already fired above.
+if [[ "$incomplete" -ne 0 || "$state_unarmed" -ne 0 || "$disk_unmeasured" -ne 0 ]]; then
+  exit 3
+fi
+if [[ "$high_water" -ne 0 ]]; then
   exit 4
 fi
 if [[ "$was_stale" -ne 0 ]]; then
