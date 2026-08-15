@@ -174,8 +174,8 @@ mkdir -p "$(dirname "$LOG_FILE")" || {
 
 incomplete=0      # something could not be removed or could not be aged — sweep is partial
 reclaimed=0       # count of objects actually removed (or that a dry run would remove)
-state_unarmed=0   # clean sweep finished but the staleness clock could not be written
-disk_unmeasured=0 # clean sweep finished but the high-water check could not read the disk
+state_unarmed=0   # agent ran but the staleness clock could not be written
+disk_unmeasured=0 # agent ran but the high-water check could not read the disk
 
 # --- helpers ------------------------------------------------------------------
 # Docker stamps three shapes: '2026-07-14T08:22:33-05:00' (volumes),
@@ -285,7 +285,7 @@ docker info >/dev/null 2>&1 || die "Docker daemon unreachable (is Colima up? 'co
 # Malformed/unreadable is NOT folded into `incomplete`: that both mis-labels the failure
 # (no object failed to sweep) and blocks the rewrite that would heal the stamp, locking
 # every later cycle on exit 3 forever. Unknown last-run is treated as stale so the
-# operator hears once; a clean sweep restamps and self-heals. A missing file is first
+# operator hears once; the next real run restamps and self-heals. A missing file is first
 # run / never armed — was_stale stays 0; a failed first write is caught as state_unarmed.
 # [LAW:types-are-the-program]
 was_stale=0
@@ -298,7 +298,7 @@ if [[ -f "$STATE_FILE" ]]; then
       warn "STALE: last run was ${gap_h}h ago (threshold ${STALE_HOURS}h) — the agent was not running. Check: launchctl print gui/\$(id -u)/com.hhouse.ci-janitor"
     fi
   else
-    warn "state file $STATE_FILE is unreadable or malformed; treating last-run as unknown (will restamp on clean sweep)"
+    warn "state file $STATE_FILE is unreadable or malformed; treating last-run as unknown (will restamp when the agent next finishes a real run)"
     was_stale=1
   fi
 fi
@@ -427,10 +427,11 @@ log "done${mode_note}: ${reclaimed} object(s) $([[ "$DRY_RUN" -ne 0 ]] && echo '
 
 # High-water's contract is "disk still high AFTER A CLEAN SWEEP" — look outside these
 # three sweeps. Firing it when incomplete=1 is a false diagnosis: the disk is high
-# because the sweep did not finish. Notify-every-alarm does not extend to an alarm
-# whose definition is conditional on another flag. [LAW:comments-carry-meaning]
+# because the sweep did not finish. Firing it on --dry-run is the same lie: nothing
+# was deleted, so "after cleaning" is false. Notify-every-alarm does not extend to an
+# alarm whose definition is conditional. Dry-run still logs disk_pct above. [LAW:comments-carry-meaning]
 high_water=0
-if [[ "$incomplete" -eq 0 && -n "$disk_pct" && "$disk_pct" -ge "$DISK_WARN_PCT" ]]; then
+if [[ "$DRY_RUN" -eq 0 && "$incomplete" -eq 0 && -n "$disk_pct" && "$disk_pct" -ge "$DISK_WARN_PCT" ]]; then
   high_water=1
 fi
 

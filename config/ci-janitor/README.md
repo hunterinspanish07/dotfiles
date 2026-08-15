@@ -130,7 +130,7 @@ All optional; the defaults are the tested ones.
 | `CI_JANITOR_DISK_WARN_PCT` | `85` | High-water mark for the post-sweep check. **Integer 1–99** (refused outside) |
 | `CI_JANITOR_STALE_HOURS` | `72` | How long silence means the agent died. **Positive integer** (refused otherwise) |
 | `CI_JANITOR_LOG` | `~/.local/share/ci-janitor/janitor.log` | Log path |
-| `CI_JANITOR_STATE` | `~/.local/share/ci-janitor/last-run` | Last successful run stamp |
+| `CI_JANITOR_STATE` | `~/.local/share/ci-janitor/last-run` | Last run stamp (agent showed up — not “sweep was clean”) |
 | `CI_JANITOR_DOCKER_DISK` | `/var/lib/docker` | Filesystem the high-water check reads |
 
 ## The related fix
