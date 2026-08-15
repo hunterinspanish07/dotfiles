@@ -177,8 +177,10 @@ mkdir -p "$(dirname "$LOG_FILE")" || {
 
 incomplete=0      # something could not be removed or could not be aged — sweep is partial
 reclaimed=0       # count of objects actually removed (or that a dry run would remove)
+age_deferred=0    # allowlist hits younger than the floor (not a fault; holds high-water)
 state_unarmed=0   # agent ran but the staleness clock could not be written
 disk_unmeasured=0 # agent ran but the high-water check could not read the disk
+state_unknown=0   # stamp existed but was unreadable/malformed (not a measured dead-agent gap)
 
 # --- helpers ------------------------------------------------------------------
 # Docker stamps three shapes: '2026-07-14T08:22:33-05:00' (volumes),
@@ -186,8 +188,9 @@ disk_unmeasured=0 # agent ran but the high-water check could not read the disk
 # The wall-clock alone is not enough: Colima's daemon TZ can differ from the Mac's,
 # and stripping the offset then re-parsing as host-local makes an object look up to
 # ~12h older/younger than it is — enough to put a live job under the 7h floor.
-# One parser: datetime + offset → epoch. Offset-less / Z → UTC. Fail closed on
-# anything else. [LAW:one-type-per-behavior] [LAW:no-ambient-temporal-coupling]
+# One parser: datetime + required offset → epoch. Z/z → UTC. Offset-less fails
+# closed (never guessed as host-local or UTC). [LAW:one-type-per-behavior]
+# [LAW:no-ambient-temporal-coupling]
 epoch_of() {
   local raw="$1" s datetime offset zflag
   s="${raw/T/ }"
@@ -216,7 +219,9 @@ CUTOFF=""
 # True only when the object is provably older than the floor. An unparseable timestamp
 # returns FALSE — the object is kept and the run is marked incomplete. Failing closed is
 # the whole safety model: never delete something whose age you could not establish.
-# [LAW:no-silent-failure]
+# Too-young is also FALSE but is NOT incomplete: it increments age_deferred so high-water
+# does not claim an "uncovered source" when the residue is just waiting to age in.
+# [LAW:no-silent-failure] [LAW:types-are-the-program]
 is_old_enough() {
   local created="$1" what="$2" epoch
   epoch=$(epoch_of "$created") || {
@@ -229,7 +234,11 @@ is_old_enough() {
     incomplete=1
     return 1
   }
-  [[ "$epoch" -lt "$CUTOFF" ]]
+  if [[ "$epoch" -lt "$CUTOFF" ]]; then
+    return 0
+  fi
+  age_deferred=$(( age_deferred + 1 ))
+  return 1
 }
 
 # grep's exit 1 means "nothing matched" — a legitimate empty result, not an error.
@@ -306,12 +315,11 @@ CUTOFF=$(( NOW_DAEMON - AGE_HOURS * 3600 ))
 # but that is precisely the case worth catching: an agent silently unloaded for weeks
 # while the disk refilled. [LAW:no-silent-failure]
 #
-# Malformed/unreadable is NOT folded into `incomplete`: that both mis-labels the failure
-# (no object failed to sweep) and blocks the rewrite that would heal the stamp, locking
-# every later cycle on exit 3 forever. Unknown last-run is treated as stale so the
-# operator hears once; the next real run restamps and self-heals. A missing file is first
-# run / never armed — was_stale stays 0; a failed first write is caught as state_unarmed.
-# Host clock: launchd lives on the Mac. [LAW:types-are-the-program]
+# Malformed/unreadable is NOT folded into `incomplete` (wrong label) or `was_stale`
+# (exit 5 / "agent was down" requires a measured gap). It is its own latch: operator
+# hears once, restamp heals, exit stays 0 if the sweep was otherwise clean.
+# Missing file = first run / never armed. Host clock: launchd lives on the Mac.
+# [LAW:types-are-the-program]
 was_stale=0
 if [[ -f "$STATE_FILE" ]]; then
   last=$(cat "$STATE_FILE" 2>/dev/null) || last=""
@@ -322,8 +330,8 @@ if [[ -f "$STATE_FILE" ]]; then
       warn "STALE: last run was ${gap_h}h ago (threshold ${STALE_HOURS}h) — the agent was not running. Check: launchctl print gui/\$(id -u)/com.hhouse.ci-janitor"
     fi
   else
-    warn "state file $STATE_FILE is unreadable or malformed; treating last-run as unknown (will restamp when the agent next finishes a real run)"
-    was_stale=1
+    warn "state file $STATE_FILE is unreadable or malformed; last-run unknown (will restamp on this real run)"
+    state_unknown=1
   fi
 fi
 
@@ -454,16 +462,19 @@ fi
 # Gating a notify on winning the cascade is how stale+high-water and
 # state_unarmed+high-water each dropped a signal — the channel must carry every
 # alarm; only the exit code is a single winner. [LAW:no-silent-failure]
-log "done${mode_note}: ${reclaimed} object(s) $([[ "$DRY_RUN" -ne 0 ]] && echo 'would be removed' || echo 'removed')"
+log "done${mode_note}: ${reclaimed} object(s) $([[ "$DRY_RUN" -ne 0 ]] && echo 'would be removed' || echo 'removed')${age_deferred:+; ${age_deferred} under age floor}"
 
-# High-water's contract is "disk still high AFTER A CLEAN SWEEP" — look outside these
-# three sweeps. Firing it when incomplete=1 is a false diagnosis: the disk is high
-# because the sweep did not finish. Firing it on --dry-run is the same lie: nothing
-# was deleted, so "after cleaning" is false. Notify-every-alarm does not extend to an
-# alarm whose definition is conditional. Dry-run still logs disk_pct above. [LAW:comments-carry-meaning]
+# High-water's contract is "disk still high AFTER reclaiming everything these sweeps
+# cover" — look outside the three signatures. Not when incomplete=1 (sweep didn't
+# finish), not on dry-run (nothing deleted), and not when age_deferred>0 (matching
+# CI garbage is simply under the floor and will age in). [LAW:comments-carry-meaning]
 high_water=0
 if [[ "$DRY_RUN" -eq 0 && "$incomplete" -eq 0 && -n "$disk_pct" && "$disk_pct" -ge "$DISK_WARN_PCT" ]]; then
-  high_water=1
+  if [[ "$age_deferred" -gt 0 ]]; then
+    log "disk ${disk_pct}% used but ${age_deferred} allowlist object(s) still under the ${AGE_HOURS}h floor — not raising high-water (covered garbage, not an outside source)"
+  else
+    high_water=1
+  fi
 fi
 
 if [[ "$was_stale" -ne 0 && "$DRY_RUN" -eq 0 ]]; then
@@ -471,6 +482,12 @@ if [[ "$was_stale" -ne 0 && "$DRY_RUN" -eq 0 ]]; then
 elif [[ "$was_stale" -ne 0 ]]; then
   # Log only: dry-run does not arm the stamp, so "It ran now" would be a lie.
   warn "STALE (dry-run): agent had not run in over ${STALE_HOURS}h — notify/exit 5 held; stamp not updated"
+fi
+if [[ "$state_unknown" -ne 0 && "$DRY_RUN" -eq 0 ]]; then
+  # Not exit 5: no gap was measured. Restamp on this run heals it.
+  notify "CI janitor found a malformed last-run stamp — restamped; not a dead-agent signal. See ${LOG_FILE}."
+elif [[ "$state_unknown" -ne 0 ]]; then
+  warn "STATE UNKNOWN (dry-run): stamp malformed — notify held; stamp not updated"
 fi
 if [[ "$incomplete" -ne 0 ]]; then
   warn "INCOMPLETE: at least one object could not be removed or aged — garbage may still be accumulating"
@@ -487,7 +504,7 @@ if [[ "$disk_unmeasured" -ne 0 ]]; then
   notify "CI janitor could not measure the Docker disk — high-water check skipped. See ${LOG_FILE}."
 fi
 if [[ "$high_water" -ne 0 ]]; then
-  warn "HIGH WATER: ${DOCKER_DISK} still ${disk_pct}% used after a clean sweep — something is accumulating that these sweeps do not cover. Inspect with: docker system df -v"
+  warn "HIGH WATER: ${DOCKER_DISK} still ${disk_pct}% used after reclaiming every eligible object — something outside these sweeps is filling it. Inspect with: docker system df -v"
   notify "CI janitor: disk still ${disk_pct}% after cleaning — something else is filling it. See ${LOG_FILE}."
 fi
 
