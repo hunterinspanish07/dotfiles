@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LaunchAgent: reclaims the disk that self-hosted CI leaks, machine-wide.
+     Sibling to com.hhouse.runner-guard — that one keeps runners alive, this one keeps
+     the disk under them from filling.
+     Install/stop: run ./install.sh in this directory (idempotent), or by hand:
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hhouse.ci-janitor.plist
+       launchctl bootout   gui/$(id -u)/com.hhouse.ci-janitor
+     Paths are absolute by this repo's convention (single-user machine); the script is
+     the dotbot-linked ~/.config/ci-janitor/ci-janitor.sh.
+
+     Daily, plus RunAtLoad so a machine that was off during a scheduled window still
+     sweeps once it comes back. The script's own age floor (24h) is what keeps a sweep
+     from touching a live job, so the schedule never has to be timed around CI. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hhouse.ci-janitor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/hhouse/.config/ci-janitor/ci-janitor.sh</string>
+  </array>
+  <!-- launchd hands agents a bare PATH; docker and colima (Homebrew) are in
+       /opt/homebrew/bin. Without this the janitor dies on its `docker info` preflight
+       every cycle — loudly (exit 2, FATAL in janitor.log) but uselessly, never doing
+       its job. install.sh verifies BOTH binaries against this exact string, read from
+       this plist, so the PATH has one source and cannot drift. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>86400</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/hhouse/.local/share/ci-janitor/launchd.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/hhouse/.local/share/ci-janitor/launchd.err</string>
+</dict>
+</plist>

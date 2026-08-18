@@ -57,6 +57,13 @@
     # launchctl step dotbot can't do: run ~/.config/runner-guard/install.sh after link.
     ~/.config/runner-guard:
       path: config/runner-guard
+    # ci-janitor — machine-wide reclamation of the disk self-hosted CI leaks. Sibling to
+    # runner-guard (that one keeps runners alive; this one keeps the disk under them from
+    # filling), so it follows the same shape: whole dir linked, giving the launchd plist a
+    # stable runtime path (~/.config/ci-janitor/ci-janitor.sh), and the same one-time
+    # launchctl step dotbot can't do — run ~/.config/ci-janitor/install.sh after link.
+    ~/.config/ci-janitor:
+      path: config/ci-janitor
     # opencode reads the SAME laws as Claude Code. It cannot run Claude Code plugins, so
     # this router plugin ports the behaviour: a system-prompt injection routes to ONE
     # medium each turn, and laws_{code,prompt,prose,ticket} tools return the vendored
