@@ -69,7 +69,7 @@ Hand off a specific instruction, keeping a compacted summary of this session (in
    - `/clear`: Claude Code → `Claude Code vN` startup banner; OpenCode → splash `Ask anything...` **and** no live `New session -` header (`/clear` is an alias of `/new`).
    - `/compact`: Claude Code → `Compacting conversation` / `Conversation compacted`; OpenCode → `Compaction ·` (app chrome; bare `Compaction` is rejected).
    A reset typed into a busy pane is swallowed as literal queued text and never runs — reading back is how the worker knows the difference.
-4. **Only if that marker is present and the pane is idle again** does it paste the message and submit it. Compact can show its marker while still running — if still busy after the settle bound, that is a MISFIRE (no paste), not a race. One on a fresh `/clear`'d session lands immediately.
+4. **Only if that marker is present and the pane is idle again** does it paste the message. It then polls until the pane shows the paste (OpenCode collapses multiline to `[Pasted ~N lines]`) before submitting — if the paste never lands, that is a MISFIRE (no Enter), not a timed guess. Compact can show its marker while still running — if still busy after the settle bound, that is a MISFIRE (no paste), not a race.
 
 The verification gate is the whole point: the paste lives *only* on the reset-confirmed branch, so it is structurally impossible to send the message into a session that wasn't reset. If the reset didn't register, the message is **not** sent — the worker instead messages that (still-live) session asking the agent to surface the misfire to the user.
 

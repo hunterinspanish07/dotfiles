@@ -191,6 +191,7 @@ case "$MODE" in
     #   OpenCode    → "Compaction ·" (during + after; bare "Compaction" is prose)
     BUSY_RE='\([0-9]+s |esc interrupt'
     pane_text() { tmux capture-pane -t "$TARGET" -p; }
+    pane_sig() { pane_text | cksum; }
     pane_busy() { pane_text | grep -qE "$BUSY_RE"; }
     pane_reset() {
       local pane
@@ -254,11 +255,25 @@ case "$MODE" in
         # [LAW:no-silent-failure] marker without idle is not a successful reset.
         log "MISFIRE: /$RESET registered after ${verify_waited}s but still busy after ${settle_waited}s settle; message NOT sent"
       else
-        log "/$RESET registered after ${verify_waited}s (settle ${settle_waited}s); sending message"
+        # [LAW:types-are-the-program] Enter is reachable only after the pane
+        # shows the paste. OpenCode collapses multiline pastes to
+        # "[Pasted ~N lines]" and may not accept input the instant the splash
+        # renders — a fixed sleep is not proof. [LAW:no-ambient-temporal-coupling]
+        before_sig=$(pane_sig)
         tmux load-buffer -b "$BUFFER" "$MSGFILE"
         tmux paste-buffer -d -b "$BUFFER" -t "$TARGET" -p
-        sleep 0.5
-        tmux send-keys -t "$TARGET" Enter
+        paste_waited=0
+        while [ "$(pane_sig)" = "$before_sig" ] && [ "$paste_waited" -lt "$VERIFY_TIMEOUT_SECONDS" ]; do
+          sleep "$POLL_INTERVAL_SECONDS"
+          paste_waited=$((paste_waited + POLL_INTERVAL_SECONDS))
+        done
+        if [ "$(pane_sig)" = "$before_sig" ]; then
+          # [LAW:no-silent-failure] splash without an accepted paste is not a send.
+          log "MISFIRE: /$RESET registered after ${verify_waited}s but paste did not land after ${paste_waited}s; message NOT submitted"
+        else
+          log "/$RESET registered after ${verify_waited}s (settle ${settle_waited}s, paste ${paste_waited}s); sending message"
+          tmux send-keys -t "$TARGET" Enter
+        fi
       fi
     elif pane_busy; then
       # [LAW:no-silent-failure] the reset never rendered AND the pane is still
