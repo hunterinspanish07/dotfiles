@@ -65,11 +65,11 @@ Hand off a specific instruction, keeping a compacted summary of this session (in
 
 1. Sleeps for the delay.
 2. Sends Escape — cancels whatever was running in the pane — then submits `/clear` or `/compact`.
-3. Reads the pane back and checks for a harness-specific marker that only a reset which actually **ran** leaves (visible chrome only — not scrollback, not the echoed command text):
-   - `/clear`: Claude Code → `Claude Code vN` startup banner; OpenCode → empty-session `Ask anything...` (`/clear` is an alias of `/new`).
-   - `/compact`: Claude Code → `Compacting conversation` / `Conversation compacted`; OpenCode → `Compaction` chrome.
+3. Reads the pane back and checks for a harness-specific marker that only a reset which actually **ran** leaves (visible chrome only — not scrollback, not the echoed command text, not bare nouns that fit in transcript prose):
+   - `/clear`: Claude Code → `Claude Code vN` startup banner; OpenCode → splash `Ask anything...` **and** no live `New session -` header (`/clear` is an alias of `/new`).
+   - `/compact`: Claude Code → `Compacting conversation` / `Conversation compacted`; OpenCode → `Compaction ·` (app chrome; bare `Compaction` is rejected).
    A reset typed into a busy pane is swallowed as literal queued text and never runs — reading back is how the worker knows the difference.
-4. **Only if that marker is present** (and the pane is idle again — compact can show its marker while still running) does it paste the message and submit it. One on a fresh `/clear`'d session lands immediately.
+4. **Only if that marker is present and the pane is idle again** does it paste the message and submit it. Compact can show its marker while still running — if still busy after the settle bound, that is a MISFIRE (no paste), not a race. One on a fresh `/clear`'d session lands immediately.
 
 The verification gate is the whole point: the paste lives *only* on the reset-confirmed branch, so it is structurally impossible to send the message into a session that wasn't reset. If the reset didn't register, the message is **not** sent — the worker instead messages that (still-live) session asking the agent to surface the misfire to the user.
 

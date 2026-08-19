@@ -24,6 +24,21 @@ POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-1}"
 IDLE_WAIT_SECONDS="${IDLE_WAIT_SECONDS:-20}"      # max wait for idle before reset
 VERIFY_TIMEOUT_SECONDS="${VERIFY_TIMEOUT_SECONDS:-20}" # max wait for reset banner
 
+# [LAW:no-silent-failure] non-positive poll interval makes the wait counters
+# stall at 0 forever (bash integer math). Reject at the boundary once.
+case "$POLL_INTERVAL_SECONDS" in
+  ''|*[!0-9]*|0) echo "POLL_INTERVAL_SECONDS must be a positive integer (got: ${POLL_INTERVAL_SECONDS})" >&2; exit 2 ;;
+esac
+case "$BOTTLE_DELAY_SECONDS" in
+  ''|*[!0-9]*) echo "BOTTLE_DELAY_SECONDS must be a non-negative integer (got: ${BOTTLE_DELAY_SECONDS})" >&2; exit 2 ;;
+esac
+case "$IDLE_WAIT_SECONDS" in
+  ''|*[!0-9]*) echo "IDLE_WAIT_SECONDS must be a non-negative integer (got: ${IDLE_WAIT_SECONDS})" >&2; exit 2 ;;
+esac
+case "$VERIFY_TIMEOUT_SECONDS" in
+  ''|*[!0-9]*) echo "VERIFY_TIMEOUT_SECONDS must be a non-negative integer (got: ${VERIFY_TIMEOUT_SECONDS})" >&2; exit 2 ;;
+esac
+
 # [LAW:one-source-of-truth] the static framing wrapped around the agent's message
 # lives here once. The launcher composes PREFIX + agent message + SUFFIX into the
 # single value that flows to the pane; the worker stays a dumb conduit. Edit the
@@ -161,29 +176,38 @@ case "$MODE" in
     log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
     # [LAW:one-type-per-behavior] both harnesses share one worker path; only the
-    # pane-marker values differ. Markers are OR'd unions of each harness's
-    # app-generated chrome — never the echoed/queued command text — so a reset
-    # swallowed as literal input cannot false-positive. Captured VISIBLE-only
-    # (no -S): scrollback can still hold a prior session's banner.
+    # pane-marker predicates differ. Markers are app-generated chrome only —
+    # never echoed command text, never a bare noun that fits in transcript prose
+    # — so a swallowed reset cannot false-positive. Captured VISIBLE-only (no
+    # -S): scrollback can still hold a prior session's banner.
     #
     # clear:
     #   Claude Code → startup banner "Claude Code vN"
-    #   OpenCode    → empty-session prompt "Ask anything..." (/clear aliases /new)
+    #   OpenCode    → splash "Ask anything..." AND no live "New session -"
+    #                 header (/clear aliases /new). Mid-session empty composers
+    #                 keep the session header and do not show the splash prompt.
     # compact:
     #   Claude Code → "Compacting conversation" / "Conversation compacted"
-    #   OpenCode    → "Compaction" chrome (header during, "Compaction ·" after)
-    case "$RESET" in
-      clear)   REGISTERED_RE='Claude Code v[0-9]|Ask anything\.\.\.' ;;
-      compact) REGISTERED_RE='Compacting conversation|Conversation compacted|Compaction' ;;
-    esac
-
-    # [LAW:types-are-the-program] "still working" is pane state, not a sleep.
-    # Claude Code: live elapsed timer in parens — "(22s · …)"; done turns read
-    # "Cooked for 8s" with no parens. OpenCode: footer "esc interrupt" while a
-    # turn/compaction runs (distinct from Claude's "esc to interrupt").
+    #   OpenCode    → "Compaction ·" (during + after; bare "Compaction" is prose)
     BUSY_RE='\([0-9]+s |esc interrupt'
-    pane_busy() { tmux capture-pane -t "$TARGET" -p | grep -qE "$BUSY_RE"; }
-    pane_reset() { tmux capture-pane -t "$TARGET" -p | grep -qE "$REGISTERED_RE"; }
+    pane_text() { tmux capture-pane -t "$TARGET" -p; }
+    pane_busy() { pane_text | grep -qE "$BUSY_RE"; }
+    pane_reset() {
+      local pane
+      pane=$(pane_text)
+      case "$RESET" in
+        clear)
+          # [LAW:types-are-the-program] OC splash prompt alone is not enough if a
+          # live session header is still on screen; require the empty-session pair.
+          echo "$pane" | grep -qE 'Claude Code v[0-9]' && return 0
+          echo "$pane" | grep -q 'Ask anything\.\.\.' \
+            && ! echo "$pane" | grep -q 'New session -'
+          ;;
+        compact)
+          echo "$pane" | grep -qE 'Compacting conversation|Conversation compacted|Compaction ·'
+          ;;
+      esac
+    }
 
     PANE_CMD=$(tmux display-message -p -t "$TARGET" '#{pane_current_command}' 2>/dev/null || echo '?')
     log "waking; target=$TARGET cmd=$PANE_CMD reset=/$RESET"
@@ -217,21 +241,25 @@ case "$MODE" in
       verify_waited=$((verify_waited + POLL_INTERVAL_SECONDS))
     done
 
-    # [LAW:types-are-the-program] the message paste is reachable only after the
-    # reset is verified to have run — it cannot land in an un-reset session.
+    # [LAW:types-are-the-program] paste is reachable only after reset registered
+    # AND the pane is idle. Compact shows its marker while still busy; settle is
+    # fail-closed — still busy after the bound → MISFIRE, never paste-anyway.
     if pane_reset; then
-      # Compact (esp. OpenCode) shows its marker while still busy; wait for idle
-      # so the paste lands on a ready prompt rather than racing the compressor.
       settle_waited=0
       while pane_busy && [ "$settle_waited" -lt "$VERIFY_TIMEOUT_SECONDS" ]; do
         sleep "$POLL_INTERVAL_SECONDS"
         settle_waited=$((settle_waited + POLL_INTERVAL_SECONDS))
       done
-      log "/$RESET registered after ${verify_waited}s (settle ${settle_waited}s); sending message"
-      tmux load-buffer -b "$BUFFER" "$MSGFILE"
-      tmux paste-buffer -d -b "$BUFFER" -t "$TARGET" -p
-      sleep 0.5
-      tmux send-keys -t "$TARGET" Enter
+      if pane_busy; then
+        # [LAW:no-silent-failure] marker without idle is not a successful reset.
+        log "MISFIRE: /$RESET registered after ${verify_waited}s but still busy after ${settle_waited}s settle; message NOT sent"
+      else
+        log "/$RESET registered after ${verify_waited}s (settle ${settle_waited}s); sending message"
+        tmux load-buffer -b "$BUFFER" "$MSGFILE"
+        tmux paste-buffer -d -b "$BUFFER" -t "$TARGET" -p
+        sleep 0.5
+        tmux send-keys -t "$TARGET" Enter
+      fi
     elif pane_busy; then
       # [LAW:no-silent-failure] the reset never rendered AND the pane is still
       # busy — a queued reset may yet fire. Typing a note now would queue behind
