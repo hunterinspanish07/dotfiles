@@ -182,7 +182,6 @@ case "$MODE" in
     # is a pane value that selects which app-chrome predicate is proof. Markers
     # are never echoed command text and never a bare noun that fits in prose.
     # Captured VISIBLE-only (no -S): scrollback can still hold a prior banner.
-    BUSY_RE='\([0-9]+s |esc interrupt'
     PANE_CMD=$(tmux display-message -p -t "$TARGET" '#{pane_current_command}' || echo '?')
     # [LAW:types-are-the-program] harness is a closed set. Unknown cannot
     # borrow Claude's markers — that would make "this is Claude" representable
@@ -193,7 +192,18 @@ case "$MODE" in
       *)          HARNESS=unknown ;;
     esac
     pane_text() { tmux capture-pane -t "$TARGET" -p; }
-    pane_busy() { pane_text | grep -qE "$BUSY_RE"; }
+    # [LAW:types-are-the-program] busy is harness-gated live chrome only.
+    # OpenCode's status line is "esc interrupt" + token stats — bare
+    # "esc interrupt" fits in transcript/source and is not proof.
+    pane_busy() {
+      local pane
+      pane=$(pane_text)
+      case "$HARNESS" in
+        claude)   echo "$pane" | grep -qE '\([0-9]+s ' ;;
+        opencode) echo "$pane" | grep -qE 'esc interrupt[[:space:]]+[0-9]+([.][0-9]+)?K[[:space:]]+\([0-9]+%\)' ;;
+        *)        return 1 ;;
+      esac
+    }
     pane_reset() {
       local pane
       pane=$(pane_text)
@@ -218,15 +228,9 @@ case "$MODE" in
     }
     # [LAW:one-type-per-behavior] idle + undelivered is one outcome: tell the
     # still-live session. Busy-unconfirmed is a different type (do not type).
-    # [LAW:no-silent-failure] drain the composer first — an undelivered paste
-    # still sitting there would share Enter with the note and submit both.
+    # Caller must ensure the composer does not hold undelivered content —
+    # this only types the note. [LAW:single-enforcer]
     tell_misfire() {
-      tmux send-keys -t "$TARGET" Escape
-      sleep 0.3
-      tmux send-keys -t "$TARGET" C-u
-      sleep 0.2
-      tmux send-keys -t "$TARGET" BSpace
-      sleep 0.2
       tmux send-keys -t "$TARGET" -l "message-in-a-bottle misfired: the scheduled /$RESET handoff was NOT sent. Please tell the user the bottle misfired."
       sleep 0.5
       tmux send-keys -t "$TARGET" Enter
@@ -310,6 +314,7 @@ case "$MODE" in
         count_paste_chips() {
           printf '%s' "$1" | grep -oE '\[Pasted ~[0-9]+ lines\]' | wc -l | tr -d '[:space:]'
         }
+        # [LAW:one-source-of-truth] same evidence gates Enter and drain.
         pane_paste_landed() {
           local now line
           now=$(pane_text)
@@ -323,8 +328,32 @@ case "$MODE" in
           done < "$MSGFILE"
           return 1
         }
+        # [LAW:types-are-the-program] misfire Enter requires pane-observed
+        # absence of our paste evidence — not a fixed clear chord + sleep.
+        # [LAW:no-silent-failure] if evidence won't clear, do not type.
+        drain_our_paste() {
+          local waited=0 i
+          while pane_paste_landed; do
+            if [ "$waited" -ge "$VERIFY_TIMEOUT_SECONDS" ]; then
+              return 1
+            fi
+            tmux send-keys -t "$TARGET" Escape
+            sleep 0.2
+            tmux send-keys -t "$TARGET" C-u
+            sleep 0.1
+            tmux send-keys -t "$TARGET" BSpace
+            for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+              tmux send-keys -t "$TARGET" C-a C-k
+            done
+            sleep "$POLL_INTERVAL_SECONDS"
+            waited=$((waited + POLL_INTERVAL_SECONDS))
+          done
+          return 0
+        }
+        # No -p: bracketed paste is what collapses the body (and BOTTLE_ID)
+        # into a chip; unbracketed keeps MSGFILE lines observable.
         tmux load-buffer -b "$BUFFER" "$MSGFILE"
-        tmux paste-buffer -d -b "$BUFFER" -t "$TARGET" -p
+        tmux paste-buffer -d -b "$BUFFER" -t "$TARGET"
         paste_waited=0
         while ! pane_paste_landed && [ "$paste_waited" -lt "$VERIFY_TIMEOUT_SECONDS" ]; do
           sleep "$POLL_INTERVAL_SECONDS"
@@ -335,9 +364,14 @@ case "$MODE" in
           tmux send-keys -t "$TARGET" Enter
         else
           # [LAW:no-silent-failure] idle + undelivered — same type as the
-          # unconfirmed-reset note; the agent must see it.
+          # unconfirmed-reset note; the agent must see it. Drain is gated on
+          # the same paste evidence as Enter; no evidence → drain is a no-op.
           log "MISFIRE: /$RESET registered after ${verify_waited}s but paste did not land after ${paste_waited}s; message NOT submitted"
-          tell_misfire
+          if drain_our_paste; then
+            tell_misfire
+          else
+            log "MISFIRE: undelivered paste still visible after drain; note NOT typed"
+          fi
         fi
       fi
     elif pane_busy; then
