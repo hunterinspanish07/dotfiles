@@ -98,7 +98,10 @@ case "$MODE" in
     # [LAW:one-source-of-truth] the wrapped value is assembled once, here, from the
     # static framing and the agent's message. Everything downstream — MSGFILE,
     # buffer, paste — carries this final value verbatim and never re-wraps it.
-    MESSAGE=$(printf '%s\n%s\n%s' "$BOTTLE_PREFIX" "$AGENT_MESSAGE" "$BOTTLE_SUFFIX")
+    # [LAW:types-are-the-program] a per-bottle id line makes "this paste" unique
+    # even when PREFIX/SUFFIX already sit in a compacted transcript.
+    BOTTLE_ID=$(date +%s).$$
+    MESSAGE=$(printf '%s\n%s\n%s\n%s' "$BOTTLE_PREFIX" "$AGENT_MESSAGE" "$BOTTLE_SUFFIX" "$BOTTLE_ID")
 
     # [LAW:no-defensive-null-guards] the tmux context is a real trust boundary —
     # fail loudly when it's absent. The message needs no such guard: it carries a
@@ -175,39 +178,38 @@ case "$MODE" in
 
     log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
-    # [LAW:one-type-per-behavior] both harnesses share one worker path; only the
-    # pane-marker predicates differ. Markers are app-generated chrome only —
-    # never echoed command text, never a bare noun that fits in transcript prose
-    # — so a swallowed reset cannot false-positive. Captured VISIBLE-only (no
-    # -S): scrollback can still hold a prior session's banner.
-    #
-    # clear:
-    #   Claude Code → startup banner "Claude Code vN"
-    #   OpenCode    → splash "Ask anything..." AND no live "New session -"
-    #                 header (/clear aliases /new). Mid-session empty composers
-    #                 keep the session header and do not show the splash prompt.
-    # compact:
-    #   Claude Code → "Compacting conversation" / "Conversation compacted"
-    #   OpenCode    → full-width box-drawing banner (during). The middot status
-    #                 line stays in the sidebar after a prior compact, so it is
-    #                 not proof this reset ran.
+    # [LAW:one-type-per-behavior] both harnesses share one worker path; harness
+    # is a pane value that selects which app-chrome predicate is proof. Markers
+    # are never echoed command text and never a bare noun that fits in prose.
+    # Captured VISIBLE-only (no -S): scrollback can still hold a prior banner.
     BUSY_RE='\([0-9]+s |esc interrupt'
+    PANE_CMD=$(tmux display-message -p -t "$TARGET" '#{pane_current_command}' 2>/dev/null || echo '?')
+    # [LAW:types-are-the-program] OC chrome is not a Claude reset proof (and
+    # vice versa). Harness is a pane fact from tmux, not a mode.
+    case "$PANE_CMD" in
+      *opencode*) HARNESS=opencode ;;
+      *)          HARNESS=claude ;;
+    esac
     pane_text() { tmux capture-pane -t "$TARGET" -p; }
     pane_busy() { pane_text | grep -qE "$BUSY_RE"; }
     pane_reset() {
       local pane
       pane=$(pane_text)
-      case "$RESET" in
-        clear)
-          # [LAW:types-are-the-program] OC splash prompt alone is not enough if a
-          # live session header is still on screen; require the empty-session pair.
-          echo "$pane" | grep -qE 'Claude Code v[0-9]' && return 0
+      case "$HARNESS:$RESET" in
+        claude:clear)
+          echo "$pane" | grep -qE 'Claude Code v[0-9]'
+          ;;
+        opencode:clear)
+          # Splash prompt AND no live session header. Mid-session empty
+          # composers keep the header and do not show the splash.
           echo "$pane" | grep -q 'Ask anything\.\.\.' \
             && ! echo "$pane" | grep -q 'New session -'
           ;;
-        compact)
-          echo "$pane" | grep -qE 'Compacting conversation|Conversation compacted' && return 0
-          # U+2500 sandwich — app chrome; cannot appear as ordinary prose.
+        claude:compact)
+          echo "$pane" | grep -qE 'Compacting conversation|Conversation compacted'
+          ;;
+        opencode:compact)
+          # U+2500 sandwich — during-banner app chrome, not leftover sidebar.
           echo "$pane" | grep -qE '─{4,} Compaction ─{4,}'
           ;;
       esac
@@ -220,8 +222,7 @@ case "$MODE" in
       tmux send-keys -t "$TARGET" Enter
     }
 
-    PANE_CMD=$(tmux display-message -p -t "$TARGET" '#{pane_current_command}' 2>/dev/null || echo '?')
-    log "waking; target=$TARGET cmd=$PANE_CMD reset=/$RESET"
+    log "waking; target=$TARGET cmd=$PANE_CMD harness=$HARNESS reset=/$RESET"
     sleep "$BOTTLE_DELAY_SECONDS"
 
     # [LAW:dataflow-not-control-flow] Escape cancels whatever was running — we
@@ -262,8 +263,20 @@ case "$MODE" in
         settle_waited=$((settle_waited + POLL_INTERVAL_SECONDS))
       done
       if pane_busy; then
-        # [LAW:no-silent-failure] marker without idle is not a successful reset.
-        log "MISFIRE: /$RESET registered after ${verify_waited}s but still busy after ${settle_waited}s settle; message NOT sent"
+        # Reset already ran; wait until it is safe to type, then tell.
+        # [LAW:one-type-per-behavior] idle+undelivered → tell_misfire.
+        # Pre-reset busy (no marker) is a different type — do not type.
+        log "MISFIRE: /$RESET registered after ${verify_waited}s but still busy after ${settle_waited}s settle; waiting for idle to notify"
+        notify_waited=0
+        while pane_busy && [ "$notify_waited" -lt "$VERIFY_TIMEOUT_SECONDS" ]; do
+          sleep "$POLL_INTERVAL_SECONDS"
+          notify_waited=$((notify_waited + POLL_INTERVAL_SECONDS))
+        done
+        if pane_busy; then
+          log "MISFIRE: still busy after ${notify_waited}s notify wait; pane left untouched"
+        else
+          tell_misfire
+        fi
       else
         # [LAW:types-are-the-program] Enter is reachable only after the composer
         # shows THIS paste — collapse chrome, or a MSGFILE line that was not on
@@ -273,7 +286,8 @@ case "$MODE" in
         pane_paste_landed() {
           local now line
           now=$(pane_text)
-          echo "$now" | grep -qE '\[Pasted ~[0-9]+ lines\]' && return 0
+          echo "$now" | grep -qE '\[Pasted ~[0-9]+ lines\]' \
+            && ! echo "$before" | grep -qE '\[Pasted ~[0-9]+ lines\]' && return 0
           while IFS= read -r line || [ -n "$line" ]; do
             [ -z "$line" ] && continue
             echo "$before" | grep -qF "$line" && continue
