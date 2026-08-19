@@ -5,7 +5,7 @@ description: Send a message to your future self. You *MUST* use this when you re
 
 # message-in-a-bottle
 
-A one-shot delayed self-message. The launcher returns immediately so the calling agent can finish its turn; a detached worker resets the context (`/clear` or `/compact`, the agent's choice) and pastes the message into the same tmux pane after the delay.
+A one-shot delayed self-message. The launcher returns immediately so the calling agent can finish its turn; a detached worker resets the context (`/clear` or `/compact`, the agent's choice) and pastes the message into the same tmux pane after the delay. Works in both **Claude Code** and **OpenCode** TUIs under tmux (litmux) — the worker matches each harness's busy/reset chrome rather than assuming Claude Code alone.
 
 ## When to use
 
@@ -65,8 +65,11 @@ Hand off a specific instruction, keeping a compacted summary of this session (in
 
 1. Sleeps for the delay.
 2. Sends Escape — cancels whatever was running in the pane — then submits `/clear` or `/compact`.
-3. Reads the pane back and checks for the marker that only a reset which actually **ran** leaves: `/clear`'s startup banner, `/compact`'s "Compacting conversation" / "Conversation compacted". (A reset typed into a busy pane is swallowed as literal queued text and never runs — reading back is how the worker knows the difference.)
-4. **Only if that marker is present** does it paste the message and submit it. `/clear` and `/compact` are handled identically: a message submitted during a `/compact` queues and fires when compaction finishes; one on a fresh `/clear`'d session lands immediately.
+3. Reads the pane back and checks for a harness-specific marker that only a reset which actually **ran** leaves (visible chrome only — not scrollback, not the echoed command text):
+   - `/clear`: Claude Code → `Claude Code vN` startup banner; OpenCode → empty-session `Ask anything...` (`/clear` is an alias of `/new`).
+   - `/compact`: Claude Code → `Compacting conversation` / `Conversation compacted`; OpenCode → `Compaction` chrome.
+   A reset typed into a busy pane is swallowed as literal queued text and never runs — reading back is how the worker knows the difference.
+4. **Only if that marker is present** (and the pane is idle again — compact can show its marker while still running) does it paste the message and submit it. One on a fresh `/clear`'d session lands immediately.
 
 The verification gate is the whole point: the paste lives *only* on the reset-confirmed branch, so it is structurally impossible to send the message into a session that wasn't reset. If the reset didn't register, the message is **not** sent — the worker instead messages that (still-live) session asking the agent to surface the misfire to the user.
 
