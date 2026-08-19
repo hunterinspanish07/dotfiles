@@ -5,7 +5,7 @@ description: Send a message to your future self. You *MUST* use this when you re
 
 # message-in-a-bottle
 
-A one-shot delayed self-message. The launcher returns immediately so the calling agent can finish its turn; a detached worker resets the context (`/clear` or `/compact`, the agent's choice) and pastes the message into the same tmux pane after the delay.
+A one-shot delayed self-message. The launcher returns immediately so the calling agent can finish its turn; a detached worker resets the context (`/clear` or `/compact`, the agent's choice) and pastes the message into the same tmux pane after the delay. Works in both **Claude Code** and **OpenCode** TUIs under tmux (litmux) — the worker matches each harness's busy/reset chrome rather than assuming Claude Code alone.
 
 ## When to use
 
@@ -65,8 +65,11 @@ Hand off a specific instruction, keeping a compacted summary of this session (in
 
 1. Sleeps for the delay.
 2. Sends Escape — cancels whatever was running in the pane — then submits `/clear` or `/compact`.
-3. Reads the pane back and checks for the marker that only a reset which actually **ran** leaves: `/clear`'s startup banner, `/compact`'s "Compacting conversation" / "Conversation compacted". (A reset typed into a busy pane is swallowed as literal queued text and never runs — reading back is how the worker knows the difference.)
-4. **Only if that marker is present** does it paste the message and submit it. `/clear` and `/compact` are handled identically: a message submitted during a `/compact` queues and fires when compaction finishes; one on a fresh `/clear`'d session lands immediately.
+3. Reads the pane back and checks for a harness-specific marker that only a reset which actually **ran** leaves (visible chrome only — not scrollback, not the echoed command text, not bare nouns that fit in transcript prose):
+   - `/clear`: Claude Code → startup version banner; OpenCode → empty-session splash **logo** (positive chrome only — `Ask anything...` alone is a standing mid-session placeholder). `/clear` aliases `/new`. Harness is `opencode*` / `*claude*` from tmux `pane_current_command`; anything else is unknown and misfires (never borrows the other harness's proof).
+   - `/compact`: Claude Code → compacting/compacted conversation chrome; OpenCode → the full-width box-drawing compaction banner (the middot status line is leftover from prior compacts and is not the gate).
+   A reset typed into a busy pane is swallowed as literal queued text and never runs — reading back is how the worker knows the difference.
+4. **Only if that marker is present and the pane is idle again** does it paste the message (bracketed, so newlines survive — the body may collapse to a chip). Paste proof is a **delta**, never mere presence: novel PREFIX (absent from the pre-paste pane), a multiset increase in collapse chips, or the unique bottle-id line from the MSGFILE body when expanded. Stale PREFIX left by an earlier bottle or by the script text on screen does not count. Only after that delta — and only if the id is still not greppable (collapsed chip) — does it type the bottle-id canary outside the chip. Canary is never typed on the fail path, so a misfire note cannot submit canary trash. If paste proof never holds, or the id never becomes greppable after a collapsed paste: MISFIRE, no Enter; drain until the deposit is gone (pane-observed, not a fixed clear chord), then tell the still-live session — if it will not clear, log only and do not type. Busy proof is harness-gated live chrome (Claude `(Ns `; OpenCode status-line `esc interrupt` followed by token stats or `tab agents`), never a bare phrase that fits in transcript. Compact can show its marker while still running — if still busy after the settle bound, wait until idle and tell the session (do not paste).
 
 The verification gate is the whole point: the paste lives *only* on the reset-confirmed branch, so it is structurally impossible to send the message into a session that wasn't reset. If the reset didn't register, the message is **not** sent — the worker instead messages that (still-live) session asking the agent to surface the misfire to the user.
 

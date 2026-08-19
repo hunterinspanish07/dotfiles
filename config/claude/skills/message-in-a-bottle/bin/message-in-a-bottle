@@ -12,16 +12,32 @@
 
 set -euo pipefail
 
-# [LAW:one-source-of-truth] timing lives here once. BOTTLE_DELAY_SECONDS is how
-# long to wait before firing. The reset is not verified with a single fixed
-# settle — a heavy (300k-token) session renders the post-reset banner well after
-# any fixed wait, and a reset typed into a still-busy pane executes only once the
-# agent goes idle. So both the pre-reset idle-wait and the post-reset banner check
+# [LAW:one-source-of-truth] timing lives here once. Defaults are the production
+# values; env overrides exist only so a live probe can shorten the delay without
+# forking the script. The reset is not verified with a single fixed settle — a
+# heavy (300k-token) session renders the post-reset banner well after any fixed
+# wait, and a reset typed into a still-busy pane executes only once the agent
+# goes idle. So both the pre-reset idle-wait and the post-reset banner check
 # POLL up to a bound instead of sleeping a fixed interval and reading once.
-BOTTLE_DELAY_SECONDS=10
-POLL_INTERVAL_SECONDS=1
-IDLE_WAIT_SECONDS=20      # max wait for the pane to go idle before sending the reset
-VERIFY_TIMEOUT_SECONDS=20 # max wait for the reset's banner to render after sending
+BOTTLE_DELAY_SECONDS="${BOTTLE_DELAY_SECONDS:-10}"
+POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-1}"
+IDLE_WAIT_SECONDS="${IDLE_WAIT_SECONDS:-20}"      # max wait for idle before reset
+VERIFY_TIMEOUT_SECONDS="${VERIFY_TIMEOUT_SECONDS:-20}" # max wait for reset banner
+
+# [LAW:no-silent-failure] non-positive poll interval makes the wait counters
+# stall at 0 forever (bash integer math). Reject at the boundary once.
+case "$POLL_INTERVAL_SECONDS" in
+  ''|*[!0-9]*|0) echo "POLL_INTERVAL_SECONDS must be a positive integer (got: ${POLL_INTERVAL_SECONDS})" >&2; exit 2 ;;
+esac
+case "$BOTTLE_DELAY_SECONDS" in
+  ''|*[!0-9]*) echo "BOTTLE_DELAY_SECONDS must be a non-negative integer (got: ${BOTTLE_DELAY_SECONDS})" >&2; exit 2 ;;
+esac
+case "$IDLE_WAIT_SECONDS" in
+  ''|*[!0-9]*) echo "IDLE_WAIT_SECONDS must be a non-negative integer (got: ${IDLE_WAIT_SECONDS})" >&2; exit 2 ;;
+esac
+case "$VERIFY_TIMEOUT_SECONDS" in
+  ''|*[!0-9]*) echo "VERIFY_TIMEOUT_SECONDS must be a non-negative integer (got: ${VERIFY_TIMEOUT_SECONDS})" >&2; exit 2 ;;
+esac
 
 # [LAW:one-source-of-truth] the static framing wrapped around the agent's message
 # lives here once. The launcher composes PREFIX + agent message + SUFFIX into the
@@ -82,7 +98,10 @@ case "$MODE" in
     # [LAW:one-source-of-truth] the wrapped value is assembled once, here, from the
     # static framing and the agent's message. Everything downstream — MSGFILE,
     # buffer, paste — carries this final value verbatim and never re-wraps it.
-    MESSAGE=$(printf '%s\n%s\n%s' "$BOTTLE_PREFIX" "$AGENT_MESSAGE" "$BOTTLE_SUFFIX")
+    # [LAW:types-are-the-program] a per-bottle id line makes "this paste" unique
+    # even when PREFIX/SUFFIX already sit in a compacted transcript.
+    BOTTLE_ID=$(date +%s).$$
+    MESSAGE=$(printf '%s\n%s\n%s\n%s' "$BOTTLE_PREFIX" "$AGENT_MESSAGE" "$BOTTLE_SUFFIX" "$BOTTLE_ID")
 
     # [LAW:no-defensive-null-guards] the tmux context is a real trust boundary —
     # fail loudly when it's absent. The message needs no such guard: it carries a
@@ -159,27 +178,87 @@ case "$MODE" in
 
     log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
-    # A reset that actually RAN leaves an app-generated marker on the visible
-    # screen that the echoed/queued command text never reproduces — so finding
-    # it can't be fooled by a reset that was swallowed as literal text. Captured
-    # VISIBLE-only (no -S): tmux scrollback still holds this session's own
-    # startup banner, and matching that stale copy would be a false positive.
-    case "$RESET" in
-      clear)   REGISTERED_RE='Claude Code v[0-9]' ;;
-      compact) REGISTERED_RE='Compacting conversation|Conversation compacted' ;;
+    # [LAW:one-type-per-behavior] both harnesses share one worker path; harness
+    # is a pane value that selects which app-chrome predicate is proof. Markers
+    # are never echoed command text and never a bare noun that fits in prose.
+    # Captured VISIBLE-only (no -S): scrollback can still hold a prior banner.
+    PANE_CMD=$(tmux display-message -p -t "$TARGET" '#{pane_current_command}' || echo '?')
+    # [LAW:types-are-the-program] harness is a closed set. Unknown cannot
+    # borrow Claude's markers — that would make "this is Claude" representable
+    # for a pane we cannot identify. [LAW:no-silent-failure]
+    case "$PANE_CMD" in
+      *opencode*) HARNESS=opencode ;;
+      *claude*)   HARNESS=claude ;;
+      *)          HARNESS=unknown ;;
     esac
+    pane_text() { tmux capture-pane -t "$TARGET" -p; }
+    # [LAW:types-are-the-program] busy is harness-gated live chrome only.
+    # OpenCode's status line is "esc interrupt" + token stats — bare
+    # "esc interrupt" fits in transcript/source and is not proof.
+    pane_busy() {
+      local pane
+      pane=$(pane_text)
+      case "$HARNESS" in
+        claude)   echo "$pane" | grep -qE '\([0-9]+s ' ;;
+        # Status line only: "esc interrupt" then token stats OR "tab agents"
+        # (splash-busy has no K% yet). Bare phrase in prose does not match.
+        opencode) echo "$pane" | grep -qE 'esc interrupt[[:space:]]+(tab agents|[0-9]+([.][0-9]+)?K)' ;;
+        *)        return 1 ;;
+      esac
+    }
+    pane_reset() {
+      local pane
+      pane=$(pane_text)
+      case "$HARNESS:$RESET" in
+        claude:clear)
+          echo "$pane" | grep -qE 'Claude Code v[0-9]'
+          ;;
+        opencode:clear)
+          # Splash logo — positive empty-session chrome only. Built from UTF-8
+          # byte escapes (bash 3.2 has no \u) so this file never contains the
+          # glyph triple and cannot self-match when displayed on the pane.
+          # "Ask anything..." alone is a standing mid-session placeholder.
+          local _b=$'\xe2\x96\x88' _h=$'\xe2\x96\x80' _u oc_logo
+          _u="${_b}${_h}${_h}${_b}"
+          oc_logo="${_u} ${_u} ${_u}"
+          echo "$pane" | grep -qF "$oc_logo"
+          ;;
+        claude:compact)
+          echo "$pane" | grep -qE 'Compacting conversation|Conversation compacted'
+          ;;
+        opencode:compact)
+          # U+2500 sandwich — during-banner app chrome, not leftover sidebar.
+          echo "$pane" | grep -qE '─{4,} Compaction ─{4,}'
+          ;;
+      esac
+    }
+    # [LAW:one-type-per-behavior] idle + undelivered is one outcome: tell the
+    # still-live session. Busy-unconfirmed is a different type (do not type).
+    # Caller must ensure the composer does not hold undelivered content —
+    # this only types the note. [LAW:single-enforcer]
+    tell_misfire() {
+      tmux send-keys -t "$TARGET" -l "message-in-a-bottle misfired: the scheduled /$RESET handoff was NOT sent. Please tell the user the bottle misfired."
+      sleep 0.5
+      tmux send-keys -t "$TARGET" Enter
+    }
 
-    # [LAW:types-are-the-program] "the agent is still working" is a state read
-    # off the pane, not a timing assumption. Claude Code's spinner carries a
-    # live elapsed-timer in parens — "(22s · …)", "(1s · esc to interrupt)";
-    # completed-turn remnants read "Cooked for 8s" with no parens, so this
-    # matches only genuine in-progress work.
-    BUSY_RE='\([0-9]+s '
-    pane_busy() { tmux capture-pane -t "$TARGET" -p | grep -qE "$BUSY_RE"; }
-    pane_reset() { tmux capture-pane -t "$TARGET" -p | grep -qE "$REGISTERED_RE"; }
-
-    log "waking; target=$TARGET reset=/$RESET"
+    log "waking; target=$TARGET cmd=$PANE_CMD harness=$HARNESS reset=/$RESET"
     sleep "$BOTTLE_DELAY_SECONDS"
+
+    if [ "$HARNESS" = unknown ]; then
+      log "MISFIRE: unknown harness cmd=$PANE_CMD; message NOT sent"
+      idle_waited=0
+      while pane_busy && [ "$idle_waited" -lt "$IDLE_WAIT_SECONDS" ]; do
+        sleep "$POLL_INTERVAL_SECONDS"
+        idle_waited=$((idle_waited + POLL_INTERVAL_SECONDS))
+      done
+      if pane_busy; then
+        log "MISFIRE: unknown harness and pane still busy; pane left untouched"
+      else
+        tell_misfire
+      fi
+      exit 2
+    fi
 
     # [LAW:dataflow-not-control-flow] Escape cancels whatever was running — we
     # never inspect what; cancelling is the point.
@@ -209,14 +288,138 @@ case "$MODE" in
       verify_waited=$((verify_waited + POLL_INTERVAL_SECONDS))
     done
 
-    # [LAW:types-are-the-program] the message paste is reachable only after the
-    # reset is verified to have run — it cannot land in an un-reset session.
+    # [LAW:types-are-the-program] paste is reachable only after reset registered
+    # AND the pane is idle. Compact shows its marker while still busy; settle is
+    # fail-closed — still busy after the bound → MISFIRE, never paste-anyway.
     if pane_reset; then
-      log "/$RESET registered after ${verify_waited}s; sending message"
-      tmux load-buffer -b "$BUFFER" "$MSGFILE"
-      tmux paste-buffer -d -b "$BUFFER" -t "$TARGET" -p
-      sleep 0.5
-      tmux send-keys -t "$TARGET" Enter
+      settle_waited=0
+      while pane_busy && [ "$settle_waited" -lt "$VERIFY_TIMEOUT_SECONDS" ]; do
+        sleep "$POLL_INTERVAL_SECONDS"
+        settle_waited=$((settle_waited + POLL_INTERVAL_SECONDS))
+      done
+      if pane_busy; then
+        # Reset already ran; wait until it is safe to type, then tell.
+        # [LAW:one-type-per-behavior] idle+undelivered → tell_misfire.
+        # Pre-reset busy (no marker) is a different type — do not type.
+        log "MISFIRE: /$RESET registered after ${verify_waited}s but still busy after ${settle_waited}s settle; waiting for idle to notify"
+        # [LAW:no-ambient-temporal-coupling] idle is the owned state; no second
+        # bound that goes quiet. Worker is detached; kill it to cancel.
+        while pane_busy; do
+          sleep "$POLL_INTERVAL_SECONDS"
+        done
+        tell_misfire
+      else
+        # [LAW:types-are-the-program] bracketed paste keeps newlines (body may
+        # collapse to a chip). Enter requires a paste-only delta (not keystrokes):
+        # novel PREFIX (absent before this paste), chip multiset increase, or the
+        # unique BOTTLE_ID line from the MSGFILE body when expanded. PREFIX mere
+        # presence is not paste — history/script text can already show it.
+        # Canary is typed ONLY after that delta, and only if the id is still not
+        # greppable (collapsed chip hides the body line). [LAW:one-source-of-truth]
+        BOTTLE_ID=$(tail -n1 "$MSGFILE")
+        PREFIX_LINE=$(head -n1 "$MSGFILE")
+        { [ -n "$BOTTLE_ID" ] && [ -n "$PREFIX_LINE" ]; } \
+          || { log "MISFIRE: MSGFILE missing PREFIX/BOTTLE_ID; message NOT sent"; exit 2; }
+        before=$(pane_text)
+        # [LAW:no-silent-failure] under pipefail, grep-no-match is exit 1 —
+        # zero chips is a valid count, not a script failure.
+        count_paste_chips() {
+          local n
+          n=$(printf '%s\n' "$1" | grep -cE '\[Pasted ~[0-9]+ lines\]' || true)
+          printf '%s' "${n:-0}"
+        }
+        before_chips=$(count_paste_chips "$before")
+        before_has_prefix=0
+        echo "$before" | grep -qF "$PREFIX_LINE" && before_has_prefix=1
+        # Paste-only proof — evaluated before any canary keystrokes.
+        pane_paste_artifact() {
+          local now chips
+          now=$(pane_text)
+          if [ "$before_has_prefix" -eq 0 ] && echo "$now" | grep -qF "$PREFIX_LINE"; then
+            return 0
+          fi
+          chips=$(count_paste_chips "$now")
+          [ "$chips" -gt "$before_chips" ] && return 0
+          # Expanded body carries the unique id line from MSGFILE.
+          echo "$now" | grep -qF "$BOTTLE_ID" && return 0
+          return 1
+        }
+        # Residual deposit (paste and/or canary) — drain until gone.
+        our_deposit_visible() {
+          local now chips
+          now=$(pane_text)
+          echo "$now" | grep -qF "$BOTTLE_ID" && return 0
+          if [ "$before_has_prefix" -eq 0 ] && echo "$now" | grep -qF "$PREFIX_LINE"; then
+            return 0
+          fi
+          chips=$(count_paste_chips "$now")
+          [ "$chips" -gt "$before_chips" ] && return 0
+          return 1
+        }
+        # [LAW:types-are-the-program] misfire Enter requires pane-observed
+        # absence of our deposit — not a fixed clear chord + sleep.
+        # [LAW:no-silent-failure] if evidence won't clear, do not type.
+        drain_our_paste() {
+          local waited=0 i
+          while our_deposit_visible; do
+            if [ "$waited" -ge "$VERIFY_TIMEOUT_SECONDS" ]; then
+              return 1
+            fi
+            tmux send-keys -t "$TARGET" Escape
+            sleep 0.2
+            tmux send-keys -t "$TARGET" C-u
+            sleep 0.1
+            tmux send-keys -t "$TARGET" BSpace
+            for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+              tmux send-keys -t "$TARGET" C-a C-k
+            done
+            sleep "$POLL_INTERVAL_SECONDS"
+            waited=$((waited + POLL_INTERVAL_SECONDS))
+          done
+          return 0
+        }
+        tmux load-buffer -b "$BUFFER" "$MSGFILE"
+        tmux paste-buffer -d -b "$BUFFER" -t "$TARGET" -p
+        sleep 0.3
+        paste_waited=0
+        while ! pane_paste_artifact && [ "$paste_waited" -lt "$VERIFY_TIMEOUT_SECONDS" ]; do
+          sleep "$POLL_INTERVAL_SECONDS"
+          paste_waited=$((paste_waited + POLL_INTERVAL_SECONDS))
+        done
+        if ! pane_paste_artifact; then
+          # [LAW:no-silent-failure] no canary typed — drain is a no-op; note safe.
+          log "MISFIRE: /$RESET registered after ${verify_waited}s but paste did not land after ${paste_waited}s; message NOT submitted"
+          if drain_our_paste; then
+            tell_misfire
+          else
+            log "MISFIRE: undelivered paste still visible after drain; note NOT typed"
+          fi
+        else
+          # Collapsed chip hides the body id — canary only after paste proof.
+          if ! echo "$(pane_text)" | grep -qF "$BOTTLE_ID"; then
+            tmux send-keys -t "$TARGET" -l " ${BOTTLE_ID}"
+            canary_waited=0
+            while ! echo "$(pane_text)" | grep -qF "$BOTTLE_ID" \
+              && [ "$canary_waited" -lt "$VERIFY_TIMEOUT_SECONDS" ]; do
+              sleep "$POLL_INTERVAL_SECONDS"
+              canary_waited=$((canary_waited + POLL_INTERVAL_SECONDS))
+            done
+            paste_waited=$((paste_waited + canary_waited))
+          fi
+          if echo "$(pane_text)" | grep -qF "$BOTTLE_ID"; then
+            log "/$RESET registered after ${verify_waited}s (settle ${settle_waited}s, paste ${paste_waited}s); sending message"
+            tmux send-keys -t "$TARGET" Enter
+          else
+            # Canary typed after artifact but never greppable — clear before note.
+            log "MISFIRE: /$RESET paste artifact seen but bottle-id never greppable after ${paste_waited}s; message NOT submitted"
+            if drain_our_paste; then
+              tell_misfire
+            else
+              log "MISFIRE: undelivered deposit still visible after drain; note NOT typed"
+            fi
+          fi
+        fi
+      fi
     elif pane_busy; then
       # [LAW:no-silent-failure] the reset never rendered AND the pane is still
       # busy — a queued reset may yet fire. Typing a note now would queue behind
@@ -227,10 +430,8 @@ case "$MODE" in
       log "MISFIRE: /$RESET did not register; message NOT sent"
       # Pane is idle with no banner: the reset was genuinely swallowed, nothing
       # is queued to fire late, so a note sent now stays in this live session
-      # rather than leaking into a reset. A fixed string, so -l carries it directly.
-      tmux send-keys -t "$TARGET" -l "message-in-a-bottle misfired: the scheduled /$RESET never registered, so the queued handoff was NOT sent. Please tell the user the bottle misfired."
-      sleep 0.5
-      tmux send-keys -t "$TARGET" Enter
+      # rather than leaking into a reset.
+      tell_misfire
     fi
     ;;
 esac
