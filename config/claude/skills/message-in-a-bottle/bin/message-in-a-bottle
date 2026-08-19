@@ -214,9 +214,14 @@ case "$MODE" in
           echo "$pane" | grep -qE 'Claude Code v[0-9]'
           ;;
         opencode:clear)
-          # Splash logo block — positive empty-session chrome only. Mid-session
-          # never paints it; "Ask anything..." alone is a standing placeholder.
-          echo "$pane" | grep -qE '█▀▀█ █▀▀█ █▀▀█'
+          # Splash logo — positive empty-session chrome only. Built from UTF-8
+          # byte escapes (bash 3.2 has no \u) so this file never contains the
+          # glyph triple and cannot self-match when displayed on the pane.
+          # "Ask anything..." alone is a standing mid-session placeholder.
+          local _b=$'\xe2\x96\x88' _h=$'\xe2\x96\x80' _u oc_logo
+          _u="${_b}${_h}${_h}${_b}"
+          oc_logo="${_u} ${_u} ${_u}"
+          echo "$pane" | grep -qF "$oc_logo"
           ;;
         claude:compact)
           echo "$pane" | grep -qE 'Compacting conversation|Conversation compacted'
@@ -304,22 +309,39 @@ case "$MODE" in
         done
         tell_misfire
       else
-        # [LAW:types-are-the-program] bracketed paste collapses the body into a
-        # chip (needed so newlines survive). The launcher's unique BOTTLE_ID is
-        # then typed AFTER the paste so it stays outside the chip — that id is
-        # the one proof of THIS paste. Chip totals and body lines are not the
-        # theorem: same-N re-bottles and viewport replacement both lie.
-        # [LAW:one-source-of-truth] BOTTLE_ID is the last line of MSGFILE.
+        # [LAW:types-are-the-program] bracketed paste keeps newlines (body may
+        # collapse to a chip). Enter requires BOTH: (1) a paste-only artifact
+        # that send-keys cannot forge alone — new collapse chip or expanded
+        # PREFIX line — AND (2) the unique BOTTLE_ID canary typed after the
+        # paste so same-N re-bottles still identify THIS deposit. Canary alone
+        # would prove keystrokes, not paste. [LAW:one-source-of-truth]
         BOTTLE_ID=$(tail -n1 "$MSGFILE")
-        [ -n "$BOTTLE_ID" ] \
-          || { log "MISFIRE: MSGFILE missing BOTTLE_ID; message NOT sent"; exit 2; }
+        PREFIX_LINE=$(head -n1 "$MSGFILE")
+        { [ -n "$BOTTLE_ID" ] && [ -n "$PREFIX_LINE" ]; } \
+          || { log "MISFIRE: MSGFILE missing PREFIX/BOTTLE_ID; message NOT sent"; exit 2; }
+        before=$(pane_text)
+        # [LAW:no-silent-failure] under pipefail, grep-no-match is exit 1 —
+        # zero chips is a valid count, not a script failure.
+        count_paste_chips() {
+          local n
+          n=$(printf '%s\n' "$1" | grep -cE '\[Pasted ~[0-9]+ lines\]' || true)
+          printf '%s' "${n:-0}"
+        }
+        before_chips=$(count_paste_chips "$before")
         # [LAW:one-source-of-truth] same predicate gates Enter and drain.
         pane_paste_landed() {
-          pane_text | grep -qF "$BOTTLE_ID"
+          local now chips
+          now=$(pane_text)
+          echo "$now" | grep -qF "$BOTTLE_ID" || return 1
+          # Paste artifact: expanded body, or a new collapse chip (multiset).
+          echo "$now" | grep -qF "$PREFIX_LINE" && return 0
+          chips=$(count_paste_chips "$now")
+          [ "$chips" -gt "$before_chips" ] && return 0
+          return 1
         }
         # [LAW:types-are-the-program] misfire Enter requires pane-observed
-        # absence of our canary — not a fixed clear chord + sleep.
-        # [LAW:no-silent-failure] if the canary won't clear, do not type.
+        # absence of our paste evidence — not a fixed clear chord + sleep.
+        # [LAW:no-silent-failure] if evidence won't clear, do not type.
         drain_our_paste() {
           local waited=0 i
           while pane_paste_landed; do
@@ -342,7 +364,7 @@ case "$MODE" in
         tmux load-buffer -b "$BUFFER" "$MSGFILE"
         tmux paste-buffer -d -b "$BUFFER" -t "$TARGET" -p
         sleep 0.3
-        # Canary outside the collapse chip — unique per bottle, survives N-collision.
+        # Canary outside the chip — unique per bottle; conjunction with paste artifact.
         tmux send-keys -t "$TARGET" -l " ${BOTTLE_ID}"
         paste_waited=0
         while ! pane_paste_landed && [ "$paste_waited" -lt "$VERIFY_TIMEOUT_SECONDS" ]; do
@@ -353,13 +375,13 @@ case "$MODE" in
           log "/$RESET registered after ${verify_waited}s (settle ${settle_waited}s, paste ${paste_waited}s); sending message"
           tmux send-keys -t "$TARGET" Enter
         else
-          # [LAW:no-silent-failure] idle + undelivered. Drain is gated on the
-          # canary; if it never appeared, drain is a no-op and the note is safe.
-          log "MISFIRE: /$RESET registered after ${verify_waited}s but paste canary did not land after ${paste_waited}s; message NOT submitted"
+          # [LAW:no-silent-failure] idle + undelivered. Drain gated on landed
+          # evidence; if nothing landed, drain is a no-op and the note is safe.
+          log "MISFIRE: /$RESET registered after ${verify_waited}s but paste did not land after ${paste_waited}s; message NOT submitted"
           if drain_our_paste; then
             tell_misfire
           else
-            log "MISFIRE: undelivered paste canary still visible after drain; note NOT typed"
+            log "MISFIRE: undelivered paste still visible after drain; note NOT typed"
           fi
         fi
       fi
