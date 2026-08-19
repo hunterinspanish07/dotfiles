@@ -188,10 +188,11 @@ case "$MODE" in
     #                 keep the session header and do not show the splash prompt.
     # compact:
     #   Claude Code → "Compacting conversation" / "Conversation compacted"
-    #   OpenCode    → "Compaction ·" (during + after; bare "Compaction" is prose)
+    #   OpenCode    → full-width box-drawing banner (during). The middot status
+    #                 line stays in the sidebar after a prior compact, so it is
+    #                 not proof this reset ran.
     BUSY_RE='\([0-9]+s |esc interrupt'
     pane_text() { tmux capture-pane -t "$TARGET" -p; }
-    pane_sig() { pane_text | cksum; }
     pane_busy() { pane_text | grep -qE "$BUSY_RE"; }
     pane_reset() {
       local pane
@@ -205,9 +206,18 @@ case "$MODE" in
             && ! echo "$pane" | grep -q 'New session -'
           ;;
         compact)
-          echo "$pane" | grep -qE 'Compacting conversation|Conversation compacted|Compaction ·'
+          echo "$pane" | grep -qE 'Compacting conversation|Conversation compacted' && return 0
+          # U+2500 sandwich — app chrome; cannot appear as ordinary prose.
+          echo "$pane" | grep -qE '─{4,} Compaction ─{4,}'
           ;;
       esac
+    }
+    # [LAW:one-type-per-behavior] idle + undelivered is one outcome: tell the
+    # still-live session. Busy-unconfirmed is a different type (do not type).
+    tell_misfire() {
+      tmux send-keys -t "$TARGET" -l "message-in-a-bottle misfired: the scheduled /$RESET handoff was NOT sent. Please tell the user the bottle misfired."
+      sleep 0.5
+      tmux send-keys -t "$TARGET" Enter
     }
 
     PANE_CMD=$(tmux display-message -p -t "$TARGET" '#{pane_current_command}' 2>/dev/null || echo '?')
@@ -255,24 +265,37 @@ case "$MODE" in
         # [LAW:no-silent-failure] marker without idle is not a successful reset.
         log "MISFIRE: /$RESET registered after ${verify_waited}s but still busy after ${settle_waited}s settle; message NOT sent"
       else
-        # [LAW:types-are-the-program] Enter is reachable only after the pane
-        # shows the paste. OpenCode collapses multiline pastes to
-        # "[Pasted ~N lines]" and may not accept input the instant the splash
-        # renders — a fixed sleep is not proof. [LAW:no-ambient-temporal-coupling]
-        before_sig=$(pane_sig)
+        # [LAW:types-are-the-program] Enter is reachable only after the composer
+        # shows THIS paste — collapse chrome, or a MSGFILE line that was not on
+        # screen before. A whole-pane checksum is not that type: timers and
+        # redraws flip it without a paste. [LAW:no-ambient-temporal-coupling]
+        before=$(pane_text)
+        pane_paste_landed() {
+          local now line
+          now=$(pane_text)
+          echo "$now" | grep -qE '\[Pasted ~[0-9]+ lines\]' && return 0
+          while IFS= read -r line || [ -n "$line" ]; do
+            [ -z "$line" ] && continue
+            echo "$before" | grep -qF "$line" && continue
+            echo "$now" | grep -qF "$line" && return 0
+          done < "$MSGFILE"
+          return 1
+        }
         tmux load-buffer -b "$BUFFER" "$MSGFILE"
         tmux paste-buffer -d -b "$BUFFER" -t "$TARGET" -p
         paste_waited=0
-        while [ "$(pane_sig)" = "$before_sig" ] && [ "$paste_waited" -lt "$VERIFY_TIMEOUT_SECONDS" ]; do
+        while ! pane_paste_landed && [ "$paste_waited" -lt "$VERIFY_TIMEOUT_SECONDS" ]; do
           sleep "$POLL_INTERVAL_SECONDS"
           paste_waited=$((paste_waited + POLL_INTERVAL_SECONDS))
         done
-        if [ "$(pane_sig)" = "$before_sig" ]; then
-          # [LAW:no-silent-failure] splash without an accepted paste is not a send.
-          log "MISFIRE: /$RESET registered after ${verify_waited}s but paste did not land after ${paste_waited}s; message NOT submitted"
-        else
+        if pane_paste_landed; then
           log "/$RESET registered after ${verify_waited}s (settle ${settle_waited}s, paste ${paste_waited}s); sending message"
           tmux send-keys -t "$TARGET" Enter
+        else
+          # [LAW:no-silent-failure] idle + undelivered — same type as the
+          # unconfirmed-reset note; the agent must see it.
+          log "MISFIRE: /$RESET registered after ${verify_waited}s but paste did not land after ${paste_waited}s; message NOT submitted"
+          tell_misfire
         fi
       fi
     elif pane_busy; then
@@ -285,10 +308,8 @@ case "$MODE" in
       log "MISFIRE: /$RESET did not register; message NOT sent"
       # Pane is idle with no banner: the reset was genuinely swallowed, nothing
       # is queued to fire late, so a note sent now stays in this live session
-      # rather than leaking into a reset. A fixed string, so -l carries it directly.
-      tmux send-keys -t "$TARGET" -l "message-in-a-bottle misfired: the scheduled /$RESET never registered, so the queued handoff was NOT sent. Please tell the user the bottle misfired."
-      sleep 0.5
-      tmux send-keys -t "$TARGET" Enter
+      # rather than leaking into a reset.
+      tell_misfire
     fi
     ;;
 esac
