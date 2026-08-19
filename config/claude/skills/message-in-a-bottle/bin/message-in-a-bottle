@@ -192,6 +192,13 @@ case "$MODE" in
       *)          HARNESS=unknown ;;
     esac
     pane_text() { tmux capture-pane -t "$TARGET" -p; }
+    # [LAW:no-silent-failure] never pipe a pane dump into grep -q under
+    # pipefail: on match grep exits early, the writer gets SIGPIPE, and
+    # "found" becomes a failed pipeline — live symptom was bottle-id
+    # visible after the chip but logged "never greppable", then drain +
+    # misfire. Match in-process; no pipe, no SIGPIPE. [LAW:single-enforcer]
+    text_has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
+    text_re()  { [[ "$1" =~ $2 ]]; }
     # [LAW:types-are-the-program] busy is harness-gated live chrome only.
     # OpenCode's status line is "esc interrupt" + token stats — bare
     # "esc interrupt" fits in transcript/source and is not proof.
@@ -199,10 +206,10 @@ case "$MODE" in
       local pane
       pane=$(pane_text)
       case "$HARNESS" in
-        claude)   echo "$pane" | grep -qE '\([0-9]+s ' ;;
+        claude)   text_re "$pane" '\([0-9]+s ' ;;
         # Status line only: "esc interrupt" then token stats OR "tab agents"
         # (splash-busy has no K% yet). Bare phrase in prose does not match.
-        opencode) echo "$pane" | grep -qE 'esc interrupt[[:space:]]+(tab agents|[0-9]+([.][0-9]+)?K)' ;;
+        opencode) text_re "$pane" 'esc interrupt[[:space:]]+(tab agents|[0-9]+([.][0-9]+)?K)' ;;
         *)        return 1 ;;
       esac
     }
@@ -211,7 +218,7 @@ case "$MODE" in
       pane=$(pane_text)
       case "$HARNESS:$RESET" in
         claude:clear)
-          echo "$pane" | grep -qE 'Claude Code v[0-9]'
+          text_re "$pane" 'Claude Code v[0-9]'
           ;;
         opencode:clear)
           # Splash logo — positive empty-session chrome only. Built from UTF-8
@@ -221,14 +228,14 @@ case "$MODE" in
           local _b=$'\xe2\x96\x88' _h=$'\xe2\x96\x80' _u oc_logo
           _u="${_b}${_h}${_h}${_b}"
           oc_logo="${_u} ${_u} ${_u}"
-          echo "$pane" | grep -qF "$oc_logo"
+          text_has "$pane" "$oc_logo"
           ;;
         claude:compact)
-          echo "$pane" | grep -qE 'Compacting conversation|Conversation compacted'
+          text_re "$pane" 'Compacting conversation|Conversation compacted'
           ;;
         opencode:compact)
           # U+2500 sandwich — during-banner app chrome, not leftover sidebar.
-          echo "$pane" | grep -qE '─{4,} Compaction ─{4,}'
+          text_re "$pane" '─{4,} Compaction ─{4,}'
           ;;
       esac
     }
@@ -330,26 +337,26 @@ case "$MODE" in
         }
         before_chips=$(count_paste_chips "$before")
         before_has_prefix=0
-        echo "$before" | grep -qF "$PREFIX_LINE" && before_has_prefix=1
+        text_has "$before" "$PREFIX_LINE" && before_has_prefix=1
         # Paste-only proof — evaluated before any canary keystrokes.
         pane_paste_artifact() {
           local now chips
           now=$(pane_text)
-          if [ "$before_has_prefix" -eq 0 ] && echo "$now" | grep -qF "$PREFIX_LINE"; then
+          if [ "$before_has_prefix" -eq 0 ] && text_has "$now" "$PREFIX_LINE"; then
             return 0
           fi
           chips=$(count_paste_chips "$now")
           [ "$chips" -gt "$before_chips" ] && return 0
           # Expanded body carries the unique id line from MSGFILE.
-          echo "$now" | grep -qF "$BOTTLE_ID" && return 0
+          text_has "$now" "$BOTTLE_ID" && return 0
           return 1
         }
         # Residual deposit (paste and/or canary) — drain until gone.
         our_deposit_visible() {
           local now chips
           now=$(pane_text)
-          echo "$now" | grep -qF "$BOTTLE_ID" && return 0
-          if [ "$before_has_prefix" -eq 0 ] && echo "$now" | grep -qF "$PREFIX_LINE"; then
+          text_has "$now" "$BOTTLE_ID" && return 0
+          if [ "$before_has_prefix" -eq 0 ] && text_has "$now" "$PREFIX_LINE"; then
             return 0
           fi
           chips=$(count_paste_chips "$now")
@@ -396,17 +403,17 @@ case "$MODE" in
           fi
         else
           # Collapsed chip hides the body id — canary only after paste proof.
-          if ! echo "$(pane_text)" | grep -qF "$BOTTLE_ID"; then
+          if ! text_has "$(pane_text)" "$BOTTLE_ID"; then
             tmux send-keys -t "$TARGET" -l " ${BOTTLE_ID}"
             canary_waited=0
-            while ! echo "$(pane_text)" | grep -qF "$BOTTLE_ID" \
+            while ! text_has "$(pane_text)" "$BOTTLE_ID" \
               && [ "$canary_waited" -lt "$VERIFY_TIMEOUT_SECONDS" ]; do
               sleep "$POLL_INTERVAL_SECONDS"
               canary_waited=$((canary_waited + POLL_INTERVAL_SECONDS))
             done
             paste_waited=$((paste_waited + canary_waited))
           fi
-          if echo "$(pane_text)" | grep -qF "$BOTTLE_ID"; then
+          if text_has "$(pane_text)" "$BOTTLE_ID"; then
             log "/$RESET registered after ${verify_waited}s (settle ${settle_waited}s, paste ${paste_waited}s); sending message"
             tmux send-keys -t "$TARGET" Enter
           else
