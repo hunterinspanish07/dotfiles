@@ -218,7 +218,15 @@ case "$MODE" in
     }
     # [LAW:one-type-per-behavior] idle + undelivered is one outcome: tell the
     # still-live session. Busy-unconfirmed is a different type (do not type).
+    # [LAW:no-silent-failure] drain the composer first — an undelivered paste
+    # still sitting there would share Enter with the note and submit both.
     tell_misfire() {
+      tmux send-keys -t "$TARGET" Escape
+      sleep 0.3
+      tmux send-keys -t "$TARGET" C-u
+      sleep 0.2
+      tmux send-keys -t "$TARGET" BSpace
+      sleep 0.2
       tmux send-keys -t "$TARGET" -l "message-in-a-bottle misfired: the scheduled /$RESET handoff was NOT sent. Please tell the user the bottle misfired."
       sleep 0.5
       tmux send-keys -t "$TARGET" Enter
@@ -292,21 +300,22 @@ case "$MODE" in
         tell_misfire
       else
         # [LAW:types-are-the-program] Enter is reachable only after the composer
-        # shows THIS paste — collapse chrome, or a MSGFILE line that was not on
-        # screen before. A whole-pane checksum is not that type: timers and
-        # redraws flip it without a paste. [LAW:no-ambient-temporal-coupling]
+        # shows THIS paste — a multiset increase in collapse chips (same-size
+        # re-bottles share the chip string; presence is the wrong theorem), or
+        # a MSGFILE line that was not on screen before. A whole-pane checksum
+        # is not that type: timers and redraws flip it without a paste.
+        # [LAW:no-ambient-temporal-coupling]
         before=$(pane_text)
+        # [LAW:one-source-of-truth] chip identity is count, not string presence.
+        count_paste_chips() {
+          printf '%s' "$1" | grep -oE '\[Pasted ~[0-9]+ lines\]' | wc -l | tr -d '[:space:]'
+        }
         pane_paste_landed() {
           local now line
           now=$(pane_text)
-          # A concrete collapse chip in now that is absent from before — not
-          # "any chip exists" and not "before had no chips at all."
-          local chip
-          while IFS= read -r chip; do
-            [ -z "$chip" ] && continue
-            echo "$before" | grep -qF "$chip" && continue
-            return 0
-          done < <(echo "$now" | grep -oE '\[Pasted ~[0-9]+ lines\]' || true)
+          # Multiset: any new collapse chip raises the total, even when N matches
+          # a prior bottle's chip string (default /next is fixed line-count).
+          [ "$(count_paste_chips "$now")" -gt "$(count_paste_chips "$before")" ] && return 0
           while IFS= read -r line || [ -n "$line" ]; do
             [ -z "$line" ] && continue
             echo "$before" | grep -qF "$line" && continue
