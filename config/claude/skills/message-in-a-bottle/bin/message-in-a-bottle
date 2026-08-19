@@ -200,7 +200,9 @@ case "$MODE" in
       pane=$(pane_text)
       case "$HARNESS" in
         claude)   echo "$pane" | grep -qE '\([0-9]+s ' ;;
-        opencode) echo "$pane" | grep -qE 'esc interrupt[[:space:]]+[0-9]+([.][0-9]+)?K[[:space:]]+\([0-9]+%\)' ;;
+        # Status line only: "esc interrupt" then token stats OR "tab agents"
+        # (splash-busy has no K% yet). Bare phrase in prose does not match.
+        opencode) echo "$pane" | grep -qE 'esc interrupt[[:space:]]+(tab agents|[0-9]+([.][0-9]+)?K)' ;;
         *)        return 1 ;;
       esac
     }
@@ -212,10 +214,9 @@ case "$MODE" in
           echo "$pane" | grep -qE 'Claude Code v[0-9]'
           ;;
         opencode:clear)
-          # Splash prompt AND no live session header. Mid-session empty
-          # composers keep the header and do not show the splash.
-          echo "$pane" | grep -q 'Ask anything\.\.\.' \
-            && ! echo "$pane" | grep -q 'New session -'
+          # Splash logo block — positive empty-session chrome only. Mid-session
+          # never paints it; "Ask anything..." alone is a standing placeholder.
+          echo "$pane" | grep -qE '█▀▀█ █▀▀█ █▀▀█'
           ;;
         claude:compact)
           echo "$pane" | grep -qE 'Compacting conversation|Conversation compacted'
@@ -303,34 +304,22 @@ case "$MODE" in
         done
         tell_misfire
       else
-        # [LAW:types-are-the-program] Enter is reachable only after the composer
-        # shows THIS paste — a multiset increase in collapse chips (same-size
-        # re-bottles share the chip string; presence is the wrong theorem), or
-        # a MSGFILE line that was not on screen before. A whole-pane checksum
-        # is not that type: timers and redraws flip it without a paste.
-        # [LAW:no-ambient-temporal-coupling]
-        before=$(pane_text)
-        # [LAW:one-source-of-truth] chip identity is count, not string presence.
-        count_paste_chips() {
-          printf '%s' "$1" | grep -oE '\[Pasted ~[0-9]+ lines\]' | wc -l | tr -d '[:space:]'
-        }
-        # [LAW:one-source-of-truth] same evidence gates Enter and drain.
+        # [LAW:types-are-the-program] bracketed paste collapses the body into a
+        # chip (needed so newlines survive). The launcher's unique BOTTLE_ID is
+        # then typed AFTER the paste so it stays outside the chip — that id is
+        # the one proof of THIS paste. Chip totals and body lines are not the
+        # theorem: same-N re-bottles and viewport replacement both lie.
+        # [LAW:one-source-of-truth] BOTTLE_ID is the last line of MSGFILE.
+        BOTTLE_ID=$(tail -n1 "$MSGFILE")
+        [ -n "$BOTTLE_ID" ] \
+          || { log "MISFIRE: MSGFILE missing BOTTLE_ID; message NOT sent"; exit 2; }
+        # [LAW:one-source-of-truth] same predicate gates Enter and drain.
         pane_paste_landed() {
-          local now line
-          now=$(pane_text)
-          # Multiset: any new collapse chip raises the total, even when N matches
-          # a prior bottle's chip string (default /next is fixed line-count).
-          [ "$(count_paste_chips "$now")" -gt "$(count_paste_chips "$before")" ] && return 0
-          while IFS= read -r line || [ -n "$line" ]; do
-            [ -z "$line" ] && continue
-            echo "$before" | grep -qF "$line" && continue
-            echo "$now" | grep -qF "$line" && return 0
-          done < "$MSGFILE"
-          return 1
+          pane_text | grep -qF "$BOTTLE_ID"
         }
         # [LAW:types-are-the-program] misfire Enter requires pane-observed
-        # absence of our paste evidence — not a fixed clear chord + sleep.
-        # [LAW:no-silent-failure] if evidence won't clear, do not type.
+        # absence of our canary — not a fixed clear chord + sleep.
+        # [LAW:no-silent-failure] if the canary won't clear, do not type.
         drain_our_paste() {
           local waited=0 i
           while pane_paste_landed; do
@@ -350,10 +339,11 @@ case "$MODE" in
           done
           return 0
         }
-        # No -p: bracketed paste is what collapses the body (and BOTTLE_ID)
-        # into a chip; unbracketed keeps MSGFILE lines observable.
         tmux load-buffer -b "$BUFFER" "$MSGFILE"
-        tmux paste-buffer -d -b "$BUFFER" -t "$TARGET"
+        tmux paste-buffer -d -b "$BUFFER" -t "$TARGET" -p
+        sleep 0.3
+        # Canary outside the collapse chip — unique per bottle, survives N-collision.
+        tmux send-keys -t "$TARGET" -l " ${BOTTLE_ID}"
         paste_waited=0
         while ! pane_paste_landed && [ "$paste_waited" -lt "$VERIFY_TIMEOUT_SECONDS" ]; do
           sleep "$POLL_INTERVAL_SECONDS"
@@ -363,14 +353,13 @@ case "$MODE" in
           log "/$RESET registered after ${verify_waited}s (settle ${settle_waited}s, paste ${paste_waited}s); sending message"
           tmux send-keys -t "$TARGET" Enter
         else
-          # [LAW:no-silent-failure] idle + undelivered — same type as the
-          # unconfirmed-reset note; the agent must see it. Drain is gated on
-          # the same paste evidence as Enter; no evidence → drain is a no-op.
-          log "MISFIRE: /$RESET registered after ${verify_waited}s but paste did not land after ${paste_waited}s; message NOT submitted"
+          # [LAW:no-silent-failure] idle + undelivered. Drain is gated on the
+          # canary; if it never appeared, drain is a no-op and the note is safe.
+          log "MISFIRE: /$RESET registered after ${verify_waited}s but paste canary did not land after ${paste_waited}s; message NOT submitted"
           if drain_our_paste; then
             tell_misfire
           else
-            log "MISFIRE: undelivered paste still visible after drain; note NOT typed"
+            log "MISFIRE: undelivered paste canary still visible after drain; note NOT typed"
           fi
         fi
       fi
