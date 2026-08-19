@@ -310,11 +310,12 @@ case "$MODE" in
         tell_misfire
       else
         # [LAW:types-are-the-program] bracketed paste keeps newlines (body may
-        # collapse to a chip). Enter requires BOTH: (1) a paste-only artifact
-        # that send-keys cannot forge alone — new collapse chip or expanded
-        # PREFIX line — AND (2) the unique BOTTLE_ID canary typed after the
-        # paste so same-N re-bottles still identify THIS deposit. Canary alone
-        # would prove keystrokes, not paste. [LAW:one-source-of-truth]
+        # collapse to a chip). Enter requires a paste-only delta (not keystrokes):
+        # novel PREFIX (absent before this paste), chip multiset increase, or the
+        # unique BOTTLE_ID line from the MSGFILE body when expanded. PREFIX mere
+        # presence is not paste — history/script text can already show it.
+        # Canary is typed ONLY after that delta, and only if the id is still not
+        # greppable (collapsed chip hides the body line). [LAW:one-source-of-truth]
         BOTTLE_ID=$(tail -n1 "$MSGFILE")
         PREFIX_LINE=$(head -n1 "$MSGFILE")
         { [ -n "$BOTTLE_ID" ] && [ -n "$PREFIX_LINE" ]; } \
@@ -328,23 +329,39 @@ case "$MODE" in
           printf '%s' "${n:-0}"
         }
         before_chips=$(count_paste_chips "$before")
-        # [LAW:one-source-of-truth] same predicate gates Enter and drain.
-        pane_paste_landed() {
+        before_has_prefix=0
+        echo "$before" | grep -qF "$PREFIX_LINE" && before_has_prefix=1
+        # Paste-only proof — evaluated before any canary keystrokes.
+        pane_paste_artifact() {
           local now chips
           now=$(pane_text)
-          echo "$now" | grep -qF "$BOTTLE_ID" || return 1
-          # Paste artifact: expanded body, or a new collapse chip (multiset).
-          echo "$now" | grep -qF "$PREFIX_LINE" && return 0
+          if [ "$before_has_prefix" -eq 0 ] && echo "$now" | grep -qF "$PREFIX_LINE"; then
+            return 0
+          fi
+          chips=$(count_paste_chips "$now")
+          [ "$chips" -gt "$before_chips" ] && return 0
+          # Expanded body carries the unique id line from MSGFILE.
+          echo "$now" | grep -qF "$BOTTLE_ID" && return 0
+          return 1
+        }
+        # Residual deposit (paste and/or canary) — drain until gone.
+        our_deposit_visible() {
+          local now chips
+          now=$(pane_text)
+          echo "$now" | grep -qF "$BOTTLE_ID" && return 0
+          if [ "$before_has_prefix" -eq 0 ] && echo "$now" | grep -qF "$PREFIX_LINE"; then
+            return 0
+          fi
           chips=$(count_paste_chips "$now")
           [ "$chips" -gt "$before_chips" ] && return 0
           return 1
         }
         # [LAW:types-are-the-program] misfire Enter requires pane-observed
-        # absence of our paste evidence — not a fixed clear chord + sleep.
+        # absence of our deposit — not a fixed clear chord + sleep.
         # [LAW:no-silent-failure] if evidence won't clear, do not type.
         drain_our_paste() {
           local waited=0 i
-          while pane_paste_landed; do
+          while our_deposit_visible; do
             if [ "$waited" -ge "$VERIFY_TIMEOUT_SECONDS" ]; then
               return 1
             fi
@@ -364,24 +381,42 @@ case "$MODE" in
         tmux load-buffer -b "$BUFFER" "$MSGFILE"
         tmux paste-buffer -d -b "$BUFFER" -t "$TARGET" -p
         sleep 0.3
-        # Canary outside the chip — unique per bottle; conjunction with paste artifact.
-        tmux send-keys -t "$TARGET" -l " ${BOTTLE_ID}"
         paste_waited=0
-        while ! pane_paste_landed && [ "$paste_waited" -lt "$VERIFY_TIMEOUT_SECONDS" ]; do
+        while ! pane_paste_artifact && [ "$paste_waited" -lt "$VERIFY_TIMEOUT_SECONDS" ]; do
           sleep "$POLL_INTERVAL_SECONDS"
           paste_waited=$((paste_waited + POLL_INTERVAL_SECONDS))
         done
-        if pane_paste_landed; then
-          log "/$RESET registered after ${verify_waited}s (settle ${settle_waited}s, paste ${paste_waited}s); sending message"
-          tmux send-keys -t "$TARGET" Enter
-        else
-          # [LAW:no-silent-failure] idle + undelivered. Drain gated on landed
-          # evidence; if nothing landed, drain is a no-op and the note is safe.
+        if ! pane_paste_artifact; then
+          # [LAW:no-silent-failure] no canary typed — drain is a no-op; note safe.
           log "MISFIRE: /$RESET registered after ${verify_waited}s but paste did not land after ${paste_waited}s; message NOT submitted"
           if drain_our_paste; then
             tell_misfire
           else
             log "MISFIRE: undelivered paste still visible after drain; note NOT typed"
+          fi
+        else
+          # Collapsed chip hides the body id — canary only after paste proof.
+          if ! echo "$(pane_text)" | grep -qF "$BOTTLE_ID"; then
+            tmux send-keys -t "$TARGET" -l " ${BOTTLE_ID}"
+            canary_waited=0
+            while ! echo "$(pane_text)" | grep -qF "$BOTTLE_ID" \
+              && [ "$canary_waited" -lt "$VERIFY_TIMEOUT_SECONDS" ]; do
+              sleep "$POLL_INTERVAL_SECONDS"
+              canary_waited=$((canary_waited + POLL_INTERVAL_SECONDS))
+            done
+            paste_waited=$((paste_waited + canary_waited))
+          fi
+          if echo "$(pane_text)" | grep -qF "$BOTTLE_ID"; then
+            log "/$RESET registered after ${verify_waited}s (settle ${settle_waited}s, paste ${paste_waited}s); sending message"
+            tmux send-keys -t "$TARGET" Enter
+          else
+            # Canary typed after artifact but never greppable — clear before note.
+            log "MISFIRE: /$RESET paste artifact seen but bottle-id never greppable after ${paste_waited}s; message NOT submitted"
+            if drain_our_paste; then
+              tell_misfire
+            else
+              log "MISFIRE: undelivered deposit still visible after drain; note NOT typed"
+            fi
           fi
         fi
       fi
