@@ -36,19 +36,50 @@ notify_fail() {
   fi
 
   # 2. Judge + write digest (headless agent under least-privilege settings).
-  out="$(claude -p "/reflect" \
-    --session-id "$REFLECT_SESSION_ID" \
-    --settings "$SKILL_DIR/reflect-settings.json" 2>&1)"
+  #
+  # A cycle's whole job is to append one entry to digest.md, so a grown digest IS the
+  # postcondition — the one authoritative signal for "did the work land". It replaces the
+  # previous grep over the agent's own prose, which could not distinguish an auth FAILURE
+  # from a digest DISCUSSING one and so false-failed 18 consecutive runs by matching its
+  # own report text. [LAW:one-source-of-truth] [LAW:verifiable-goals]
+  digest="$LOG_DIR/digest.md"
+  touch "$digest"   # always present, so the size reads below need no absence guard
+  size_before="$(wc -c < "$digest")"
+
+  # The session id is the only thing that varies per attempt, so it crosses as a value
+  # rather than as a branch. [LAW:dataflow-not-control-flow]
+  attempt() {
+    claude -p "/reflect" \
+      --session-id "$1" \
+      --settings "$SKILL_DIR/reflect-settings.json" 2>&1
+  }
+
+  out="$(attempt "$REFLECT_SESSION_ID")"
   rc=$?
   printf '%s\n' "$out"
 
-  # claude -p exits 0 even when unauthenticated, so detect auth failure in the text too —
-  # a daily job that silently no-ops is the exact failure the loop exists to prevent. [LAW:no-silent-failure]
-  if [ "$rc" -ne 0 ] || printf '%s' "$out" | grep -qiE 'not logged in|please run /login|invalid api key|authentication'; then
-    echo "!!! reflect FAILED (rc=$rc): headless claude errored or is unauthenticated."
-    echo "!!! Fix: run 'claude login' once in a terminal so the Keychain credential exists for launchd."
-    notify_fail "headless claude errored or unauthenticated (rc=$rc) — run 'claude login'"
+  # Every observed death was transient (connection closed mid-response, computer slept)
+  # and left no entry behind, costing a full day of history. Retry on the postcondition,
+  # not on rc: a run that already wrote its entry needs no second pass. The retry takes a
+  # fresh session id, which the miner auto-excludes (it skips any session that ran
+  # /reflect), so a retry can never leak into the window it will later mine.
+  if [ "$(wc -c < "$digest")" -le "$size_before" ]; then
+    echo "--- no digest entry written (rc=$rc); retrying once after 30s backoff ---"
+    sleep 30
+    out="$(attempt "$(uuidgen)")"
+    rc=$?
+    printf '%s\n' "$out"
+  fi
+
+  size_after="$(wc -c < "$digest")"
+  # Report what is actually known — no entry — rather than asserting a cause the wrapper
+  # cannot observe; auth is offered as the likeliest hypothesis. [LAW:no-silent-failure]
+  if [ "$size_after" -le "$size_before" ]; then
+    echo "!!! reflect FAILED (rc=$rc): no cycle entry was appended to digest.md."
+    echo "!!! If the output above shows a login or credential error, run 'claude login'"
+    echo "!!! once in a terminal so the Keychain credential exists for launchd."
+    notify_fail "reflect wrote no digest entry (rc=$rc) — see run.log"
     exit 1
   fi
-  echo "=== exit $rc ==="
+  echo "=== exit $rc (digest ${size_before}B -> ${size_after}B) ==="
 } >> "$LOG_DIR/run.log" 2>&1
