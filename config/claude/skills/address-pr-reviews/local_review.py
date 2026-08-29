@@ -33,6 +33,16 @@ never read as a clean, zero-finding pass.
 module state. `trigger` posts the verdict comment synchronously; `fetch` reads
 the newest `REVIEW_COMPLETE` comment on the PR, which — because `trigger` just
 posted it — is always the current review.
+
+Every pass reviews everything since a BASELINE, and the baseline is a value (see
+`Baseline`), not a mode. On a PR nobody has reviewed the baseline is the
+merge-base, so the model sees the whole diff. On a follow-up the baseline is the
+commit the last verdict judged — recorded on that verdict comment, so the PR
+itself is the only place the baseline lives — and the model sees its own standing
+findings plus the fixups, instead of the entire PR re-sent at full price for a
+three-line change. [LAW:dataflow-not-control-flow] first pass and follow-up run
+the identical code with different values in it; there is no incremental mode to
+turn on and no flag to get wrong.
 """
 
 from __future__ import annotations
@@ -88,6 +98,27 @@ _LOCAL_LAW_OF_RECORD = (
 # The contract trailer — the single machine-verifiable verdict, identical to the
 # CI opencode provider's, so every provider converges on the same signal.
 REVIEW_COMPLETE_RE = re.compile(r"REVIEW_COMPLETE:\s*(\d+)")
+
+# The two machine-readable stamps the ENGINE writes onto its own comments, as
+# HTML comments (invisible in GitHub's rendered view).
+#
+# `MARKER_TOKEN` tags a trigger marker so the next pass can drop it from the
+# prompt. Keying on this token rather than on the marker's prose is what makes
+# the filter hold across providers: a Runner supplies marker *wording*, never
+# the contract. [LAW:one-source-of-truth]
+#
+# `REVIEWED_SHA` records which commit a verdict actually judged, making the PR
+# itself the single home of the review baseline — no local state file, nothing
+# to desync, and a fresh context or a different machine reads the same answer.
+# The engine stamps it because the engine is what computed the diff; asking the
+# model to echo a SHA back would be a second, drift-prone map of a fact the
+# caller already holds. [LAW:one-source-of-truth] [FRAMING:representation]
+MARKER_TOKEN = "<!-- pr-review:marker -->"
+REVIEWED_SHA_RE = re.compile(r"<!--\s*pr-review:reviewed-sha:\s*([0-9a-f]{7,40})\s*-->")
+
+
+def _reviewed_sha_stamp(sha: str) -> str:
+    return f"<!-- pr-review:reviewed-sha: {sha} -->"
 
 # How a local model delivers its review. The shared brief's output contract says
 # "post a summary comment"; a local model does not post — the harness does. This
@@ -195,13 +226,15 @@ def _remote_slug(path: str) -> str | None:
     return m.group(1).lower() if m else None
 
 
-def _pr_head_branch(owner: str, repo: str, pr_num: int) -> str | None:
+def _pr_field(owner: str, repo: str, pr_num: int, field: str) -> str | None:
+    """One scalar field off the PR, or None when it can't be read.
+    [LAW:one-type-per-behavior] `headRefName` and `baseRefName` are the same
+    read with a different value in it, not two functions."""
     raw = github_threads.gh(
-        "pr", "view", str(pr_num), "--repo", f"{owner}/{repo}",
-        "--json", "headRefName",
+        "pr", "view", str(pr_num), "--repo", f"{owner}/{repo}", "--json", field,
     )
     try:
-        return json.loads(raw).get("headRefName") if raw else None
+        return json.loads(raw).get(field) if raw else None
     except json.JSONDecodeError:
         return None
 
@@ -270,88 +303,258 @@ def _repo_root(owner: str, repo: str, pr_num: int) -> str:
             "silently grade the diff alone. Run the skill from the PR's worktree, "
             f"or set PR_REVIEW_REPO_ROOT to a {owner}/{repo} checkout."
         )
-    return _branch_worktree(candidate, _pr_head_branch(owner, repo, pr_num)) or candidate
+    head_branch = _pr_field(owner, repo, pr_num, "headRefName")
+    return _branch_worktree(candidate, head_branch) or candidate
 
 
-def _prior_discussion(owner: str, repo: str, pr_num: int) -> str:
-    """Existing PR issue + review comments, so the reviewer honors 'do not
-    re-raise concerns already discussed in this PR's threads.'"""
+def _git(root: str, *args: str) -> str:
+    """One git call in the review root. [LAW:single-enforcer] every git shell-out
+    the engine makes goes through here. [LAW:no-silent-failure] a nonzero exit
+    raises with git's own stderr rather than yielding an empty string that would
+    read downstream as 'nothing changed'."""
+    proc = subprocess.run(
+        ["git", "-C", root, *args], capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"`git {' '.join(args)}` failed in {root}: {proc.stderr.strip()[:500]}"
+        )
+    return proc.stdout
+
+
+def _have(root: str, rev: str) -> bool:
+    return subprocess.run(
+        ["git", "-C", root, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"],
+        capture_output=True,
+    ).returncode == 0
+
+
+def _resolve(root: str, rev: str) -> str:
+    """`rev` as a concrete commit sha, fetching once if the object isn't local
+    yet (a worktree can legitimately be behind the PR's head or its base).
+
+    [LAW:no-silent-failure] a rev that is still unresolvable after the fetch is a
+    hard stop with an actionable message — never a silent fall back to a wider or
+    narrower diff, which would change what the reviewer is judging without
+    anyone being told."""
+    if not _have(root, rev):
+        subprocess.run(["git", "-C", root, "fetch", "origin"], capture_output=True)
+    if not _have(root, rev):
+        raise RuntimeError(
+            f"Cannot resolve {rev!r} in {root} even after `git fetch origin` — the "
+            "review baseline is unknown, so the diff under review cannot be "
+            "computed. Check that the worktree tracks the PR's remote."
+        )
+    return _git(root, "rev-parse", f"{rev}^{{commit}}").strip()
+
+
+@dataclass(frozen=True)
+class Baseline:
+    """What this review pass is measured against.
+
+    [LAW:one-type-per-behavior] a first pass and a follow-up pass are not two
+    kinds of review — they are this one type holding different values, so the
+    engine below has one code path and no mode:
+
+      cold  — `sha` is the merge-base with the PR's base branch, `standing` is
+              empty, `since` is empty. The diff is the whole PR.
+      warm  — `sha` is the commit the last verdict judged, `standing` is that
+              verdict, `since` is when it posted. The diff is the fixups.
+
+    [LAW:dataflow-not-control-flow] `standing` and `since` are empty strings on a
+    cold pass rather than None, because the empty string is the identity value
+    for both consumers: nothing to carry forward, and `created_at > ""` is true
+    for every comment. That is what lets the caller skip the `if first_pass`
+    branch entirely — the values differ, the operations do not."""
+
+    sha: str
+    standing: str
+    since: str
+
+
+def _baseline(owner: str, repo: str, pr_num: int, root: str, head: str) -> Baseline:
+    """Resolve this pass's baseline from the PR itself. [LAW:one-source-of-truth]
+    the stamp on the newest verdict comment is the only record of what has been
+    reviewed; there is no local state file to fall out of sync with it.
+
+    [LAW:no-defensive-null-guards] the optionality of "is there a prior verdict,
+    and is its commit reachable" is resolved once, here at the trust boundary,
+    and every caller downstream gets a total `Baseline`.
+
+    An unstamped or unreachable prior verdict yields the cold baseline — the full
+    PR diff. That is the conservative direction (more code reviewed, never less)
+    and it is what the reviewer did before stamping existed, so verdicts posted
+    by an older version degrade to today's behavior rather than to a gap."""
+    verdict = _latest_review_comment(owner, repo, pr_num)
+    stamp = REVIEWED_SHA_RE.search(verdict[1].get("body") or "") if verdict else None
+    if stamp and _have(root, stamp.group(1)):
+        comment = verdict[1]
+        return Baseline(
+            sha=_resolve(root, stamp.group(1)),
+            standing=comment.get("body") or "",
+            since=comment.get("created_at") or "",
+        )
+    base_branch = _pr_field(owner, repo, pr_num, "baseRefName")
+    if not base_branch:
+        raise RuntimeError(
+            f"Cannot read the base branch of {owner}/{repo}#{pr_num} — the review "
+            "baseline is unknown; refusing to guess the diff under review."
+        )
+    base = _resolve(root, f"origin/{base_branch}")
+    return Baseline(sha=_git(root, "merge-base", base, head).strip(),
+                    standing="", since="")
+
+
+def _human_replies(owner: str, repo: str, pr_num: int, since: str) -> str:
+    """PR discussion the reviewer has not already seen: comments posted after
+    `since`, minus the reviewer's own exhaust.
+
+    Two classes of comment are dropped because feeding them back costs tokens and
+    actively degrades the review. A trigger MARKER carries no information at all.
+    A superseded VERDICT is worse than noise: it lists findings that have since
+    been fixed, and a reviewer reading them re-raises settled concerns. The
+    verdict that still matters — the newest one — reaches the model as
+    `Baseline.standing`, once. [LAW:one-source-of-truth]
+
+    Filtering keys on the engine's own machine-readable stamps, never on marker
+    prose, so it holds for every provider's wording — a provider can reword its
+    marker freely without silently breaking this filter, which is precisely what
+    a prose match would do.
+
+    One bounded gap: markers posted before `MARKER_TOKEN` existed carry no token.
+    A warm pass drops them anyway (they predate `since`), but a cold pass on such
+    a PR still carries them once. Matching the old prose instead would trade a
+    permanent fragile match for a shrinking historical cost, so it is left
+    alone."""
     issue = _gh_json(
         "api", f"repos/{owner}/{repo}/issues/{pr_num}/comments?per_page=100",
-        "--jq", "[.[] | {author: .user.login, body}]",
+        "--jq", "[.[] | {author: .user.login, body, created_at}]",
     ) or []
     review = _gh_json(
         "api", f"repos/{owner}/{repo}/pulls/{pr_num}/comments?per_page=100",
-        "--jq", "[.[] | {author: .user.login, body}]",
+        "--jq", "[.[] | {author: .user.login, body, created_at}]",
     ) or []
-    lines = [
-        f"@{c['author']}: {(c.get('body') or '')[:4000]}"
-        for c in (*issue, *review) if (c.get("body") or "").strip()
-    ]
+    lines = []
+    for c in (*issue, *review):
+        body = (c.get("body") or "").strip()
+        if not body or (c.get("created_at") or "") <= since:
+            continue
+        if MARKER_TOKEN in body or REVIEW_COMPLETE_RE.search(body):
+            continue
+        lines.append(f"@{c['author']}: {body[:4000]}")
     return "\n\n".join(lines)
 
 
-def build_prompt(owner: str, repo: str, pr_num: int) -> str:
-    """The review input handed to the model: PR metadata, prior discussion, and
-    the diff under review. [LAW:no-silent-failure] an empty diff is an error
-    (nothing to review / inaccessible PR), never a silent clean pass."""
+def build_prompt(owner: str, repo: str, pr_num: int, root: str,
+                 baseline: Baseline, head: str) -> str:
+    """The review input handed to the model: PR metadata, the findings still
+    standing from the last pass, discussion since then, and the diff since the
+    baseline commit.
+
+    [LAW:one-source-of-truth] the diff is always `git diff baseline..head` — one
+    mechanism for "what changed since the baseline", whether the baseline is the
+    merge-base (whole PR) or the last reviewed commit (the fixups). Deriving the
+    cold diff from `gh pr diff` and the warm one from git would be two maps of
+    one fact, free to disagree about the merge-base.
+
+    [LAW:no-silent-failure] an empty diff on a COLD pass is an error — nothing to
+    review, or the PR is inaccessible. On a warm pass it is a fact, not a fault:
+    the author pushed no code and is answering the review in prose, which the
+    caller has already established is worth a pass."""
     meta_raw = github_threads.gh(
-        "pr", "view", str(pr_num), "--repo", f"{owner}/{repo}",
-        "--json", "title,body",
+        "pr", "view", str(pr_num), "--repo", f"{owner}/{repo}", "--json", "title,body",
     )
     meta = json.loads(meta_raw) if meta_raw else {}
 
-    diff = subprocess.run(
-        ["gh", "pr", "diff", str(pr_num), "--repo", f"{owner}/{repo}"],
-        capture_output=True, text=True,
-    )
-    if diff.returncode != 0:
+    diff = _git(root, "diff", f"{baseline.sha}..{head}")
+    if not diff.strip() and not baseline.standing:
         raise RuntimeError(
-            f"`gh pr diff` failed for {owner}/{repo}#{pr_num}: "
-            f"{diff.stderr.strip()[:500]}"
-        )
-    if not diff.stdout.strip():
-        raise RuntimeError(
-            f"`gh pr diff` returned an empty diff for {owner}/{repo}#{pr_num} — "
-            "nothing to review, or the PR/diff is inaccessible."
+            f"`git diff {baseline.sha[:8]}..{head[:8]}` is empty for "
+            f"{owner}/{repo}#{pr_num} — nothing to review, or the PR/diff is "
+            "inaccessible."
         )
 
-    prior = _prior_discussion(owner, repo, pr_num)
+    replies = _human_replies(owner, repo, pr_num, baseline.since)
     parts = [
         f"Review pull request {owner}/{repo}#{pr_num} adversarially, per your "
         "system instructions.",
         f"Title: {meta.get('title', '')}",
         f"Description:\n{meta.get('body') or '(none)'}",
     ]
-    if prior:
+    if baseline.standing:
+        # A follow-up pass. The standing verdict IS the carried-forward finding
+        # list, and the contract below is what keeps `REVIEW_COMPLETE: <N>`
+        # meaning "concerns still open on this PR" rather than "concerns new
+        # since the last pass" — without it, a fixup pass that finds nothing new
+        # would report 0 and end the author's loop with the first pass's findings
+        # unaddressed. [LAW:verifiable-goals]
         parts.append(
-            "Existing review discussion on this PR — do NOT re-raise concerns "
-            f"already discussed here (resolved or not):\n{prior}"
+            "You have ALREADY reviewed this PR. Your previous verdict, in full, is "
+            f"below. The author has since pushed the changes in the diff.\n\n"
+            f"--- YOUR PREVIOUS VERDICT ---\n{baseline.standing}\n--- END ---"
+        )
+        parts.append(
+            "This pass judges TWO things:\n"
+            "1. Each concern from your previous verdict: is it now actually fixed? "
+            "Read the current file at each cited location to check — do not assume "
+            "the diff below tells the whole story.\n"
+            "2. The new changes in the diff: do they introduce any new defect, "
+            "including breaking something the diff does not touch?\n\n"
+            "CRITICAL — the count in your trailer is the number of concerns STILL "
+            "OPEN on this PR: every previous concern you judge unfixed, PLUS every "
+            "new one. Restate each still-open concern (you may keep it brief and "
+            "reference your earlier wording); list each fixed one as resolved and "
+            "do NOT count it. `REVIEW_COMPLETE: 0` means the whole PR is clean, "
+            "never merely that this fixup added nothing new.\n\n"
+            "Do not re-raise a concern you previously listed and the author "
+            "rebutted in the discussion below."
+        )
+    if replies:
+        parts.append(
+            "New discussion since your last verdict — do NOT re-raise concerns "
+            f"settled here:\n{replies}"
         )
     parts.append(
         "You may read any file in the repository for surrounding context "
-        "(callers, schemas, tests) before judging."
+        "(callers, schemas, tests) before judging. The diff below is the change "
+        "under review, not the limit of what you may read."
     )
-    parts.append(f"Diff under review:\n```diff\n{diff.stdout}\n```")
+    label = (
+        f"Changes since your last review ({baseline.sha[:8]}..{head[:8]})"
+        if baseline.standing else "Diff under review"
+    )
+    parts.append(f"{label}:\n```diff\n{diff}\n```")
     return "\n\n".join(parts)
 
 
-def _run_review(owner: str, repo: str, pr_num: int, runner: Runner) -> str:
+def _stamp(review: str, sha: str) -> str:
+    """Record which commit this verdict judged, immediately above the trailer so
+    `REVIEW_COMPLETE: <N>` stays the last line the contract promises it is.
+
+    [LAW:one-source-of-truth] this stamp is what makes the PR the single home of
+    the review baseline; the next pass reads it back in `_baseline`."""
+    line = REVIEW_COMPLETE_RE.search(review)
+    head, tail = review[:line.start()].rstrip(), review[line.start():]
+    return f"{head}\n\n{_reviewed_sha_stamp(sha)}\n\n{tail}"
+
+
+def _run_review(owner: str, repo: str, pr_num: int, runner: Runner,
+                root: str, baseline: Baseline, head: str) -> str:
     """Run the local review via the runner and return its text, validated to
-    carry the `REVIEW_COMPLETE` trailer. Pure compute: reads, never writes.
+    carry the `REVIEW_COMPLETE` trailer and stamped with the commit it judged.
+    Pure compute plus the stamp: reads, never writes.
 
     [LAW:single-enforcer] the trailer check lives here, once, for every runner —
     a runner owns only its own exit/timeout handling; the verdict contract that
     is identical across all local reviewers is enforced in exactly one place."""
-    prompt = build_prompt(owner, repo, pr_num)
-    cwd = _repo_root(owner, repo, pr_num)
-    review = runner.run(prompt, review_brief(), cwd).strip()
+    prompt = build_prompt(owner, repo, pr_num, root, baseline, head)
+    review = runner.run(prompt, review_brief(), root).strip()
     if not REVIEW_COMPLETE_RE.search(review):
         raise RuntimeError(
             f"{runner.cli} review produced no `REVIEW_COMPLETE: <N>` trailer — the "
             "verdict is missing, not clean; do not treat this as a clean review."
         )
-    return review
+    return _stamp(review, head)
 
 
 def _post_comment(owner: str, repo: str, pr_num: int, body: str,
@@ -372,16 +575,38 @@ def _post_comment(owner: str, repo: str, pr_num: int, body: str,
 
 
 def trigger(pr_url: str, runner: Runner) -> dict:
-    """Post a visible 'triggered' marker, run the local review, then post its
-    verdict as a PR comment.
+    """Ensure a current verdict exists for the PR's head commit.
 
-    The marker makes the trigger observable on the PR the moment a review is
-    requested — before the local review (minutes) finishes — mirroring the
-    visible /opencode trigger comment. It carries no `REVIEW_COMPLETE` trailer,
-    so fetch() never mistakes it for the verdict."""
+    This is an idempotent upsert, not an unconditional run. A pass is warranted
+    when the author has pushed code since the last verdict, or has said something
+    new on the PR (a pushback deserves an answer — and without that second
+    condition the caller's loop would spin forever: the author argues, the
+    reviewer never re-runs, `fetch` returns the same open findings). When neither
+    is true, the standing verdict already covers this commit and re-running would
+    buy an identical answer at full price.
+
+    [LAW:effects-at-boundaries] the expensive effect is performed here at the
+    edge, and the edge is the right place to decide whether it is needed at all —
+    the same shape as any idempotent write. Nothing downstream branches: callers
+    get a verdict covering head either way.
+
+    The marker makes a real run observable on the PR the moment it starts —
+    before the review (minutes) finishes — mirroring the visible /opencode
+    trigger comment. It carries no `REVIEW_COMPLETE` trailer, so fetch() never
+    mistakes it for the verdict."""
     owner, repo, pr_num = github_threads.parse_pr(pr_url)
-    _post_comment(owner, repo, pr_num, runner.marker, pr_url, "trigger marker")
-    review = _run_review(owner, repo, pr_num, runner)
+    root = _repo_root(owner, repo, pr_num)
+    head = _resolve(root, github_threads.head_sha(owner, repo, pr_num))
+    baseline = _baseline(owner, repo, pr_num, root, head)
+
+    if baseline.sha == head and not _human_replies(owner, repo, pr_num, baseline.since):
+        return {"triggered": False, "comment_url": None, "reason": "verdict current"}
+
+    _post_comment(
+        owner, repo, pr_num, f"{runner.marker}\n\n{MARKER_TOKEN}",
+        pr_url, "trigger marker",
+    )
+    review = _run_review(owner, repo, pr_num, runner, root, baseline, head)
     posted = _post_comment(owner, repo, pr_num, review, pr_url, "review verdict")
     return {"triggered": True, "comment_url": posted}
 
