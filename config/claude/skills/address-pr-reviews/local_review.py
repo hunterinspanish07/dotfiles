@@ -392,7 +392,16 @@ class Baseline:
       cold  — `sha` is the merge-base with the PR's base branch, `standing` is
               empty, `since` is empty. The diff is the whole PR.
       warm  — `sha` is the commit the last verdict judged, `standing` is that
-              verdict, `since` is when it posted. The diff is the fixups.
+              verdict's TEXT with the engine's stamp stripped out, `since` is
+              when it posted. The diff is the fixups.
+
+    `standing` carries findings, never bookkeeping. The stamp is stripped at the
+    boundary that builds this value because `standing` is quoted back to the
+    model in the prompt: a stamp the model can see is a stamp the model can
+    echo, and an echoed stamp in the posted verdict is a second, older answer to
+    "which commit did this judge" sitting ahead of the real one in the same
+    comment. Removing it here makes that unrepresentable rather than defended
+    against downstream. [LAW:types-are-the-program] [LAW:one-source-of-truth]
 
     [LAW:dataflow-not-control-flow] `standing` and `since` are empty strings on a
     cold pass rather than None, because the empty string is the identity value
@@ -431,7 +440,7 @@ def _baseline(owner: str, repo: str, pr_num: int, root: str, head: str,
         comment = verdict[1]
         return Baseline(
             sha=_resolve(root, stamp.group(2)),
-            standing=comment.get("body") or "",
+            standing=VERDICT_RE.sub("", comment.get("body") or "").strip(),
             since=comment.get("created_at") or "",
         )
     base_branch = _pr_field(owner, repo, pr_num, "baseRefName")

@@ -211,3 +211,29 @@ def test_verdict_stamp_round_trips():
     m = local_review.VERDICT_RE.search(local_review._verdict_stamp(MODEL_B, HEAD_SHA))
     assert m
     assert (m.group(1), m.group(2)) == (MODEL_B, HEAD_SHA)
+
+
+# --- _baseline: what the standing verdict carries into the prompt -------------
+
+
+def test_standing_verdict_carries_findings_but_not_the_engine_stamp(monkeypatch):
+    """`Baseline.standing` is quoted back to the model verbatim, so it must
+    carry the previous findings and NOT the engine's stamp. A stamp the model
+    can see is a stamp it can echo, and an echoed stamp would sit ahead of the
+    real one in the next posted verdict — an older answer to "which commit did
+    this judge" that `VERDICT_RE.search` would reach first."""
+    _issue_comments(monkeypatch, [
+        _comment("bot", _verdict_body(MODEL_A, BASE_SHA, 2), "2026-08-29T10:00:00Z"),
+    ])
+    monkeypatch.setattr(local_review, "_have", lambda root, rev: True)
+    monkeypatch.setattr(local_review, "_resolve", lambda root, rev: rev)
+
+    baseline = local_review._baseline("owner", "repo", 1, "/tmp", HEAD_SHA, MODEL_A)
+
+    assert baseline.sha == BASE_SHA
+    assert local_review.VERDICT_RE.search(baseline.standing) is None
+    assert "pr-review:verdict" not in baseline.standing
+    # The findings — and the model's own trailer, which `_trailer` resolves by
+    # last match — must survive; only the engine's bookkeeping is removed.
+    assert "Findings from" in baseline.standing
+    assert "REVIEW_COMPLETE: 2" in baseline.standing
