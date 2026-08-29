@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""grok PR review provider — runs the adversarial review LOCALLY with the
-`opencode` CLI driving grok-4.5 on the xAI subscription, then posts the verdict
-as a PR issue comment carrying the `REVIEW_COMPLETE: <N>` contract trailer.
+"""glm PR review provider — runs the adversarial review LOCALLY with the
+`opencode` CLI driving glm-5.3-flash on the OpenRouter API key, then posts the
+verdict as a PR issue comment carrying the `REVIEW_COMPLETE: <N>` contract
+trailer.
 
-This is a thin binding of `opencode_local`, the one shared machine for every
+A thin binding of `opencode_local`, the one shared machine for every
 opencode-driven reviewer — invocation, read-only boundary, timeout, verdict
 extraction, and auth preflight all live there. This file contributes only the
-three values that make grok grok: the model, the display label, and the
+three values that make glm glm: the model, the display label, and the
 credential. Switch reviewers by editing one value in `provider.json`
 (`{"provider": "grok"}` ↔ `{"provider": "deepseek"}` ↔ `{"provider": "glm"}` ↔
 `{"provider": "claude"}`); the loop does not change.
@@ -20,12 +21,12 @@ import sys
 import local_review
 import opencode_local
 
-# The reviewer model, in opencode's `provider/model` form — the capable xAI
-# model on the subscription. Retune by editing this one line.
-MODEL = "xai/grok-4.6"
-LABEL = "Grok"
-CREDENTIAL = "xAI subscription"
-AUTH_PROVIDER = "xai"
+# The reviewer model, in opencode's `provider/model` form. Retune by editing
+# this one line.
+MODEL = "openrouter/z-ai/glm-5.3-flash"
+LABEL = "GLM"
+CREDENTIAL = "OpenRouter API key"
+AUTH_PROVIDER = "openrouter"
 
 RUNNER = opencode_local.runner(MODEL, LABEL, CREDENTIAL)
 
