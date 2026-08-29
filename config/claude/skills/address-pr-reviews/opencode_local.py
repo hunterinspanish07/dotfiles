@@ -142,13 +142,17 @@ def runner(model: str, label: str, credential: str) -> local_review.Runner:
     """Bind one opencode reviewer: `model` in opencode's `provider/model` form,
     `label` for the trigger marker ("Grok", "DeepSeek", ...), `credential` for
     what pays for it ("the xAI subscription", "the OpenRouter API key", ...).
-    Everything else — invocation, read-only boundary, timeout, verdict
-    extraction — is identical across reviewers and owned by this module.
+    `model` does double duty: opencode invokes it, and the engine stamps it on
+    this reviewer's verdicts as their machine identity — so it must name the
+    reviewing configuration uniquely, not just the invocation. Everything else
+    — invocation, read-only boundary, timeout, verdict extraction — is
+    identical across reviewers and owned by this module.
     """
     def run(prompt: str, brief: str, cwd: str) -> str:
         return _run(model, prompt, brief, cwd)
 
     return local_review.Runner(
+        model=model,
         cli="opencode",
         describe=f"opencode ({model})",
         marker=(

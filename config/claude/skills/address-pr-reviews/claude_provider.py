@@ -73,6 +73,10 @@ def _run(prompt: str, brief: str, cwd: str) -> str:
 
 
 RUNNER = local_review.Runner(
+    # Effort is part of the verdict identity for the same reason the model tier
+    # is: it changes how deep the review goes, so changing it must invalidate
+    # stale verdicts rather than silently inherit them.
+    model=f"claude/{MODEL}/effort={EFFORT}",
     cli="claude",
     describe=f"claude ({MODEL}, effort={EFFORT})",
     marker=(
@@ -101,7 +105,7 @@ def wait(pr_url: str) -> dict:
 
 
 def fetch(pr_url: str) -> dict:
-    return local_review.fetch(pr_url)
+    return local_review.fetch(pr_url, RUNNER)
 
 
 if __name__ == "__main__":

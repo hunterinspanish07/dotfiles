@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """deepseek PR review provider — runs the adversarial review LOCALLY with the
-`opencode` CLI driving deepseek-v4-flash-0731 on the OpenRouter API key, then
-posts the verdict as a PR issue comment carrying the `REVIEW_COMPLETE: <N>`
-contract trailer.
+`opencode` CLI driving deepseek-v4-pro on the OpenRouter API key, then posts
+the verdict as a PR issue comment carrying the `REVIEW_COMPLETE: <N>` contract
+trailer.
 
 A thin binding of `opencode_local`, the one shared machine for every
 opencode-driven reviewer — invocation, read-only boundary, timeout, verdict
@@ -22,8 +22,12 @@ import local_review
 import opencode_local
 
 # The reviewer model, in opencode's `provider/model` form. Retune by editing
-# this one line.
-MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
+# this one line. The `pro` tier, not `flash`: a reviewer's whole job is to tell
+# a clean diff from a defective one, and a model too weak to find the defect
+# reports the same `REVIEW_COMPLETE: 0` a genuinely clean PR earns.
+# [LAW:no-silent-failure] the cheaper tier makes those two outcomes
+# indistinguishable, which is the one failure this loop cannot tolerate.
+MODEL = "openrouter/deepseek/deepseek-v4-pro"
 LABEL = "DeepSeek"
 CREDENTIAL = "OpenRouter API key"
 AUTH_PROVIDER = "openrouter"
@@ -49,7 +53,7 @@ def wait(pr_url: str) -> dict:
 
 
 def fetch(pr_url: str) -> dict:
-    return local_review.fetch(pr_url)
+    return local_review.fetch(pr_url, RUNNER)
 
 
 if __name__ == "__main__":

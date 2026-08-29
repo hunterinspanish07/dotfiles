@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """glm PR review provider — runs the adversarial review LOCALLY with the
-`opencode` CLI driving glm-5.3-flash on the OpenRouter API key, then posts the
+`opencode` CLI driving glm-5.3 on the OpenRouter API key, then posts the
 verdict as a PR issue comment carrying the `REVIEW_COMPLETE: <N>` contract
 trailer.
 
@@ -22,8 +22,10 @@ import local_review
 import opencode_local
 
 # The reviewer model, in opencode's `provider/model` form. Retune by editing
-# this one line.
-MODEL = "openrouter/z-ai/glm-5.3-flash"
+# this one line. The full tier, not `flash`, for the same reason deepseek runs
+# `pro`: a reviewer too weak to find the defect emits the identical
+# `REVIEW_COMPLETE: 0` a clean PR earns. [LAW:no-silent-failure]
+MODEL = "openrouter/z-ai/glm-5.3"
 LABEL = "GLM"
 CREDENTIAL = "OpenRouter API key"
 AUTH_PROVIDER = "openrouter"
@@ -49,7 +51,7 @@ def wait(pr_url: str) -> dict:
 
 
 def fetch(pr_url: str) -> dict:
-    return local_review.fetch(pr_url)
+    return local_review.fetch(pr_url, RUNNER)
 
 
 if __name__ == "__main__":
