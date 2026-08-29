@@ -687,39 +687,51 @@ def _latest_review_comment(owner: str, repo: str, pr_num: int, model: str):
     none exists.
 
     Keyed on the engine's verdict stamp — not on author, and not on the
-    contract trailer. The stamp is the one thing only the engine writes, so it
-    is the one thing that cannot be forged by prose; and it is model-scoped, so
-    the verdict read back is the one the matching configuration produced. The
-    count still comes from the `REVIEW_COMPLETE: <N>` trailer, the model's
+    contract trailer — and model-scoped, so the verdict read back is the one
+    the matching configuration produced.
+
+    What the stamp is and is NOT: it defends against COLLISION, not forgery.
+    The engine posts through `gh` as the human's own account, so `author` can
+    never separate engine from human and checking it would buy nothing. What
+    the stamp buys is that no one writes it by ACCIDENT — quoting the trailer
+    in a reply is natural and used to be read as a verdict, whereas nobody
+    types a full stamp by mistake. Anyone able to comment can still type one
+    deliberately; this boundary assumes a trusted commenter, and the merge
+    automation gated on these verdicts inherits that assumption.
+    [FRAMING:representation]
+
+    The count still comes from the `REVIEW_COMPLETE: <N>` trailer, the model's
     contract — its last match, per `_trailer`, never a prose quote of an
-    earlier count. [LAW:no-silent-failure] a stamped comment with no trailer is
-    a verdict whose count is missing — not zero, and not skippable — so it
-    halts. trigger() posts a fresh verdict immediately before fetch() runs, so
-    the newest such comment is always the current review.
-    [LAW:one-source-of-truth]
+    earlier count. [LAW:no-silent-failure] the trailer is required on the
+    SELECTED verdict — the newest — and only there: a missing count on the
+    current verdict is not zero and halts, while an older malformed comment is
+    not the current verdict and must not wedge every future read of this PR.
+    trigger() posts a fresh verdict immediately before fetch() runs, so the
+    newest such comment is always the current review. [LAW:one-source-of-truth]
     """
     comments = _gh_json(
         "api", f"repos/{owner}/{repo}/issues/{pr_num}/comments?per_page=100",
         "--jq", "[.[] | {author: .user.login, body, created_at}]",
     ) or []
-    best = None  # (created_at, n, comment)
+    best = None  # (created_at, comment)
     for c in comments:
         m = VERDICT_RE.search(c.get("body") or "")
         if not m or m.group(1) != model:
             continue
-        t = _trailer(c.get("body") or "")
-        if not t:
-            raise RuntimeError(
-                f"Verdict comment by {c.get('author')} on {owner}/{repo}#{pr_num} "
-                f"carries {model}'s verdict stamp but no `REVIEW_COMPLETE: <N>` "
-                "trailer — the count is missing, not zero; do not treat this as "
-                "a clean review."
-            )
         if best is None or c["created_at"] > best[0]:
-            best = (c["created_at"], int(t.group(1)), c)
+            best = (c["created_at"], c)
     if best is None:
         return None
-    return best[1], best[2]
+    comment = best[1]
+    trailer = _trailer(comment.get("body") or "")
+    if not trailer:
+        raise RuntimeError(
+            f"The newest {model} verdict on {owner}/{repo}#{pr_num} (by "
+            f"{comment.get('author')}) carries the verdict stamp but no "
+            "`REVIEW_COMPLETE: <N>` trailer — the count is missing, not zero; "
+            "do not treat this as a clean review."
+        )
+    return int(trailer.group(1)), comment
 
 
 def fetch(pr_url: str, runner: Runner) -> dict:

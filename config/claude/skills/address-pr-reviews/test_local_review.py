@@ -237,3 +237,31 @@ def test_standing_verdict_carries_findings_but_not_the_engine_stamp(monkeypatch)
     # last match — must survive; only the engine's bookkeeping is removed.
     assert "Findings from" in baseline.standing
     assert "REVIEW_COMPLETE: 2" in baseline.standing
+
+
+def test_an_older_malformed_verdict_does_not_wedge_the_current_one(monkeypatch):
+    """A stamped comment with no trailer that is NOT the newest must be passed
+    over, not raised on. Raising mid-scan wedges every future read of the PR
+    for that model — a stale comment (a human pasting a stamp while discussing
+    the mechanism) would permanently block a perfectly good newer verdict, with
+    no recovery except editing PR history."""
+    _issue_comments(monkeypatch, [
+        _comment("someone", f'<!-- pr-review:verdict model="{MODEL_A}" sha="{BASE_SHA}" -->',
+                 "2026-08-29T09:00:00Z"),
+        _comment("bot", _verdict_body(MODEL_A, HEAD_SHA, 0), "2026-08-29T10:00:00Z"),
+    ])
+    n, comment = local_review._latest_review_comment("owner", "repo", 1, MODEL_A)
+    assert n == 0
+    assert HEAD_SHA in comment["body"]
+
+
+def test_the_newest_verdict_missing_its_trailer_still_halts(monkeypatch):
+    """The check moved to the selected verdict, but it must still fire there:
+    the CURRENT verdict with no count is a missing count, never a clean zero."""
+    _issue_comments(monkeypatch, [
+        _comment("bot", _verdict_body(MODEL_A, BASE_SHA, 0), "2026-08-29T09:00:00Z"),
+        _comment("someone", f'<!-- pr-review:verdict model="{MODEL_A}" sha="{HEAD_SHA}" -->',
+                 "2026-08-29T10:00:00Z"),
+    ])
+    with pytest.raises(RuntimeError, match="count is missing"):
+        local_review._latest_review_comment("owner", "repo", 1, MODEL_A)
