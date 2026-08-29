@@ -178,6 +178,35 @@ def test_stamp_keeps_the_trailer_last_and_carries_the_verdict_stamp():
     assert m.group(2) == HEAD_SHA
 
 
+def test_stamp_lands_on_the_real_trailer_not_a_quoted_count():
+    # A review that quotes an earlier pass's count in prose before delivering
+    # the real trailer: the stamp must sit directly above the REAL trailer —
+    # the last match, the contract's final line — not beside the quote.
+    review = (
+        "The previous pass reported REVIEW_COMPLETE: 2; both concerns are now "
+        "fixed in this push.\n\nREVIEW_COMPLETE: 0"
+    )
+    stamped = local_review._stamp(review, MODEL_A, HEAD_SHA)
+    lines = stamped.splitlines()
+    assert lines[-1] == "REVIEW_COMPLETE: 0"
+    assert lines[-3] == local_review._verdict_stamp(MODEL_A, HEAD_SHA)
+
+
+def test_count_read_back_is_the_trailers_not_a_quoted_count(monkeypatch):
+    # The verdict the engine posts from a review that quoted an earlier count:
+    # the count read back must be the trailer's, never the quoted one.
+    _issue_comments(monkeypatch, [
+        _comment("github-actions[bot]",
+                 local_review._stamp(
+                     "Previous pass said REVIEW_COMPLETE: 2 — both fixed.\n\n"
+                     "REVIEW_COMPLETE: 0",
+                     MODEL_A, HEAD_SHA),
+                 "2026-08-29T10:00:00Z"),
+    ])
+    n, _ = local_review._latest_review_comment("owner", "repo", 1, MODEL_A)
+    assert n == 0
+
+
 def test_verdict_stamp_round_trips():
     m = local_review.VERDICT_RE.search(local_review._verdict_stamp(MODEL_B, HEAD_SHA))
     assert m

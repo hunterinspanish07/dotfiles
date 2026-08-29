@@ -132,6 +132,18 @@ VERDICT_RE = re.compile(
 def _verdict_stamp(model: str, sha: str) -> str:
     return f'<!-- pr-review:verdict model="{model}" sha="{sha}" -->'
 
+
+def _trailer(review: str):
+    """The contract trailer: the LAST `REVIEW_COMPLETE: <N>` match in the text.
+    The delivery contract pins the trailer as the final line, so an earlier
+    match is prose — the model quoting an earlier pass's count, or the brief's
+    own instruction — not the verdict. The stamp's insertion point and the
+    count that is read back both key on this last match: keying on the first
+    would strand the stamp mid-prose beside a quoted count and then report
+    that quoted count as the verdict. [LAW:one-source-of-truth]"""
+    matches = list(REVIEW_COMPLETE_RE.finditer(review))
+    return matches[-1] if matches else None
+
 # How a local model delivers its review. The shared brief's output contract says
 # "post a summary comment"; a local model does not post — the harness does. This
 # is appended to the brief so the criteria stay shared and only delivery
@@ -568,8 +580,9 @@ def _stamp(review: str, model: str, sha: str) -> str:
 
     [LAW:one-source-of-truth] this one stamp is the single home of verdict
     identity — verdict-ness, producer, and judged commit — and what makes the PR
-    itself the record the next pass reads back in `_baseline` and `fetch`."""
-    line = REVIEW_COMPLETE_RE.search(review)
+    itself the record the next pass reads back in `_baseline` and `fetch`.
+    Insertion keys on the trailer match, never on a prose quote of it."""
+    line = _trailer(review)
     head, tail = review[:line.start()].rstrip(), review[line.start():]
     return f"{head}\n\n{_verdict_stamp(model, sha)}\n\n{tail}"
 
@@ -585,7 +598,7 @@ def _run_review(owner: str, repo: str, pr_num: int, runner: Runner,
     is identical across all local reviewers is enforced in exactly one place."""
     prompt = build_prompt(owner, repo, pr_num, root, baseline, head)
     review = runner.run(prompt, review_brief(), root).strip()
-    if not REVIEW_COMPLETE_RE.search(review):
+    if not _trailer(review):
         raise RuntimeError(
             f"{runner.cli} review produced no `REVIEW_COMPLETE: <N>` trailer — the "
             "verdict is missing, not clean; do not treat this as a clean review."
@@ -669,10 +682,12 @@ def _latest_review_comment(owner: str, repo: str, pr_num: int, model: str):
     is the one thing that cannot be forged by prose; and it is model-scoped, so
     the verdict read back is the one the matching configuration produced. The
     count still comes from the `REVIEW_COMPLETE: <N>` trailer, the model's
-    contract. [LAW:no-silent-failure] a stamped comment with no trailer is a
-    verdict whose count is missing — not zero, and not skippable — so it halts.
-    trigger() posts a fresh verdict immediately before fetch() runs, so the
-    newest such comment is always the current review. [LAW:one-source-of-truth]
+    contract — its last match, per `_trailer`, never a prose quote of an
+    earlier count. [LAW:no-silent-failure] a stamped comment with no trailer is
+    a verdict whose count is missing — not zero, and not skippable — so it
+    halts. trigger() posts a fresh verdict immediately before fetch() runs, so
+    the newest such comment is always the current review.
+    [LAW:one-source-of-truth]
     """
     comments = _gh_json(
         "api", f"repos/{owner}/{repo}/issues/{pr_num}/comments?per_page=100",
@@ -683,7 +698,7 @@ def _latest_review_comment(owner: str, repo: str, pr_num: int, model: str):
         m = VERDICT_RE.search(c.get("body") or "")
         if not m or m.group(1) != model:
             continue
-        t = REVIEW_COMPLETE_RE.search(c.get("body") or "")
+        t = _trailer(c.get("body") or "")
         if not t:
             raise RuntimeError(
                 f"Verdict comment by {c.get('author')} on {owner}/{repo}#{pr_num} "
