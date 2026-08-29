@@ -117,15 +117,22 @@ is a bug that leaves threads open forever.
 
 Required when `CAPABILITIES["trigger"]` is `True`.
 
-Explicitly requests a review from the backend.
+Ensures a current verdict exists for the PR's head commit.
 
 ```python
 # return value
-{"triggered": True}
+{"triggered": True,  "comment_url": "https://..."}   # a review ran
+{"triggered": False, "reason": "verdict current"}    # the standing verdict already covers head
 ```
 
-When `trigger` is `False`, the provider fires on push automatically — the
-skill does not call this function.
+`triggered: False` is a success, not a skip: the backend determined the existing
+verdict already judges this exact commit and nothing new was said on the PR, so
+re-running would buy an identical answer at full price. Either way the
+postcondition is the same — a verdict covering head exists — so the caller does
+not branch on this field. The loop's convergence signal remains `fetch`.
+
+When `CAPABILITIES["trigger"]` is `False`, the provider fires on push
+automatically — the skill does not call this function.
 
 ### `setup_check(owner: str, repo: str) -> dict`
 

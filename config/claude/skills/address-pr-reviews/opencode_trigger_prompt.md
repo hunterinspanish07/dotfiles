@@ -26,4 +26,4 @@ Post a summary comment that lists every distinct concern you raised (each with i
 
 REVIEW_COMPLETE: <N>
 
-where `<N>` is the number of distinct concerns you raised (`0` if the PR is clean / approved). This trailer is the machine-readable verdict the author's review loop converges on — it must be present on every review, and `<N>` must equal the number of concerns you listed.
+where `<N>` is the number of distinct concerns you are leaving **open on this PR** (`0` if the PR is clean / approved). On a first review that is simply the number you raised. If the message tells you this is a follow-up pass on a PR you already reviewed, it is every earlier concern you judge still unfixed plus every new one — a fixup that introduced nothing new does not make the PR clean. This trailer is the machine-readable verdict the author's review loop converges on — it must be present on every review, and `<N>` must equal the number of open concerns you listed.
