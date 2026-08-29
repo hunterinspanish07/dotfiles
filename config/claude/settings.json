@@ -26,12 +26,6 @@
     ],
     "defaultMode": "auto"
   },
-  "autoMode": {
-    "allow": [
-      "$defaults",
-      "`gh pr merge` on a pull request this session opened, when the conversation shows either an explicit user instruction to merge or an active `/auto` autonomy grant covering the ticket. Merging is already double-gated outside the classifier: `gh pr merge` refuses a PR whose required checks are red, and the `address-pr-reviews` Finalize step only reaches the merge on its MergeAndChain arm, which a grant file on disk selects. Absent one of those two authorizations, this rule does not apply and the merge stays blocked."
-    ]
-  },
   "model": "opus",
   "hooks": {
     "Stop": [
@@ -135,5 +129,11 @@
   "remoteControlAtStartup": true,
   "inputNeededNotifEnabled": true,
   "agentPushNotifEnabled": true,
+  "autoMode": {
+    "allow": [
+      "$defaults",
+      "`gh pr merge` on a pull request this session opened, when the conversation shows either an explicit user instruction to merge or an active `/auto` autonomy grant covering the ticket. Merging is already double-gated outside the classifier: `gh pr merge` refuses a PR whose required checks are red, and the `address-pr-reviews` Finalize step only reaches the merge on its MergeAndChain arm, which a grant file on disk selects. Absent one of those two authorizations, this rule does not apply and the merge stays blocked."
+    ]
+  },
   "voiceEnabled": true
 }
