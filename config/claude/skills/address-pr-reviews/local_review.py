@@ -31,18 +31,18 @@ never read as a clean, zero-finding pass.
 
 [LAW:no-shared-mutable-globals] nothing passes trigger -> wait -> fetch through
 module state. `trigger` posts the verdict comment synchronously; `fetch` reads
-the newest `REVIEW_COMPLETE` comment on the PR, which — because `trigger` just
-posted it — is always the current review.
+the newest verdict stamped with this runner's model, which — because `trigger`
+just posted it with the same runner — is always the current review.
 
 Every pass reviews everything since a BASELINE, and the baseline is a value (see
-`Baseline`), not a mode. On a PR nobody has reviewed the baseline is the
+`Baseline`), not a mode. On a PR this model has not reviewed the baseline is the
 merge-base, so the model sees the whole diff. On a follow-up the baseline is the
-commit the last verdict judged — recorded on that verdict comment, so the PR
-itself is the only place the baseline lives — and the model sees its own standing
-findings plus the fixups, instead of the entire PR re-sent at full price for a
-three-line change. [LAW:dataflow-not-control-flow] first pass and follow-up run
-the identical code with different values in it; there is no incremental mode to
-turn on and no flag to get wrong.
+commit this model's last verdict judged — recorded in the stamp on that verdict
+comment, so the PR itself is the only place the baseline lives — and the model
+sees its own standing findings plus the fixups, instead of the entire PR re-sent
+at full price for a three-line change. [LAW:dataflow-not-control-flow] first
+pass and follow-up run the identical code with different values in it; there is
+no incremental mode to turn on and no flag to get wrong.
 """
 
 from __future__ import annotations
@@ -95,8 +95,10 @@ _LOCAL_LAW_OF_RECORD = (
     "exact `[LAW:<token>]` the matching law-set defines."
 )
 
-# The contract trailer — the single machine-verifiable verdict, identical to the
-# CI opencode provider's, so every provider converges on the same signal.
+# The contract trailer — the model's finding COUNT, identical to the CI
+# opencode provider's, so every provider converges on the same signal. It
+# supplies the count ONLY; whether a comment is a verdict at all is answered by
+# the engine's verdict stamp below, never by this prose — a human can quote it.
 REVIEW_COMPLETE_RE = re.compile(r"REVIEW_COMPLETE:\s*(\d+)")
 
 # The two machine-readable stamps the ENGINE writes onto its own comments, as
@@ -107,18 +109,28 @@ REVIEW_COMPLETE_RE = re.compile(r"REVIEW_COMPLETE:\s*(\d+)")
 # the filter hold across providers: a Runner supplies marker *wording*, never
 # the contract. [LAW:one-source-of-truth]
 #
-# `REVIEWED_SHA` records which commit a verdict actually judged, making the PR
-# itself the single home of the review baseline — no local state file, nothing
-# to desync, and a fresh context or a different machine reads the same answer.
-# The engine stamps it because the engine is what computed the diff; asking the
-# model to echo a SHA back would be a second, drift-prone map of a fact the
-# caller already holds. [LAW:one-source-of-truth] [FRAMING:representation]
+# The VERDICT stamp is the single home of verdict identity: *that* a comment is
+# an engine verdict, *which model* produced it, and *which commit* it judged —
+# one stamp, because two would make "model without sha" and "sha without model"
+# representable, and neither is a real state. Its presence — not the
+# `REVIEW_COMPLETE` trailer, which is the MODEL's contract and therefore prose
+# a human can legitimately quote — is what answers "is this comment a verdict";
+# the trailer survives only to supply the count. [LAW:one-source-of-truth] the
+# model key scopes a verdict to the configuration that produced it, so one
+# reviewer's verdict is never another reviewer's baseline, and the sha makes
+# the PR itself the single home of the review baseline — no local state file,
+# nothing to desync, and a fresh context or a different machine reads the same
+# answer. The engine stamps both facts because the engine is what computed
+# them; asking the model to echo either back would be a second, drift-prone
+# map of a fact the caller already holds. [FRAMING:representation]
 MARKER_TOKEN = "<!-- pr-review:marker -->"
-REVIEWED_SHA_RE = re.compile(r"<!--\s*pr-review:reviewed-sha:\s*([0-9a-f]{7,40})\s*-->")
+VERDICT_RE = re.compile(
+    r'<!--\s*pr-review:verdict\s+model="([^"]+)"\s+sha="([0-9a-f]{7,40})"\s*-->'
+)
 
 
-def _reviewed_sha_stamp(sha: str) -> str:
-    return f"<!-- pr-review:reviewed-sha: {sha} -->"
+def _verdict_stamp(model: str, sha: str) -> str:
+    return f'<!-- pr-review:verdict model="{model}" sha="{sha}" -->'
 
 # How a local model delivers its review. The shared brief's output contract says
 # "post a summary comment"; a local model does not post — the harness does. This
@@ -143,9 +155,17 @@ class Runner:
     """The one seam a local provider supplies: which model, invoked how.
 
     [LAW:types-are-the-program] everything a local reviewer varies is exactly
-    these four fields — the binary to preflight, two human-readable strings, and
-    the pure `run` that turns (prompt, brief, cwd) into the review text. Nothing
-    else about a local reviewer differs, so nothing else is representable here.
+    these five fields — the machine key naming the reviewing configuration, the
+    binary to preflight, two human-readable strings, and the pure `run` that
+    turns (prompt, brief, cwd) into the review text. Nothing else about a local
+    reviewer differs, so nothing else is representable here.
+
+    `model` is the machine identity of the reviewing configuration, stamped on
+    every verdict this runner produces and matched when one is read back. The
+    other fields cannot supply it: `cli` is "opencode" for three different
+    reviewers, and `describe` and `marker` are human prose — which this file
+    already refuses to treat as contract anywhere else, and does not start to
+    here.
 
     `run(prompt, brief, cwd) -> str` executes the model read-only in `cwd`,
     combining `brief` (the shared criteria) with `prompt` (this PR's diff +
@@ -153,6 +173,7 @@ class Runner:
     its own exit-code/timeout handling and raises `RuntimeError` on failure; the
     engine owns the trailer check that applies to every runner alike."""
 
+    model: str                                  # machine key naming the reviewing configuration, for the stamp
     cli: str                                    # binary preflighted on PATH
     describe: str                               # setup_check success label
     marker: str                                 # the triggered-marker comment body
@@ -372,25 +393,32 @@ class Baseline:
     since: str
 
 
-def _baseline(owner: str, repo: str, pr_num: int, root: str, head: str) -> Baseline:
+def _baseline(owner: str, repo: str, pr_num: int, root: str, head: str,
+              model: str) -> Baseline:
     """Resolve this pass's baseline from the PR itself. [LAW:one-source-of-truth]
-    the stamp on the newest verdict comment is the only record of what has been
-    reviewed; there is no local state file to fall out of sync with it.
+    the verdict stamp on the newest verdict comment naming THIS model is the
+    only record of what has been reviewed; there is no local state file to fall
+    out of sync with it. The model key is load-bearing: a verdict from a
+    different model is not this model's baseline, so one reviewer's verdict can
+    never stand in for another's — a cheaper reviewer's clean pass must not
+    block a stronger one from ever running.
 
-    [LAW:no-defensive-null-guards] the optionality of "is there a prior verdict,
-    and is its commit reachable" is resolved once, here at the trust boundary,
-    and every caller downstream gets a total `Baseline`.
+    [LAW:no-defensive-null-guards] the optionality of "is there a prior verdict
+    for this model, and is its commit reachable" is resolved once, here at the
+    trust boundary, and every caller downstream gets a total `Baseline`.
 
-    An unstamped or unreachable prior verdict yields the cold baseline — the full
-    PR diff. That is the conservative direction (more code reviewed, never less)
-    and it is what the reviewer did before stamping existed, so verdicts posted
-    by an older version degrade to today's behavior rather than to a gap."""
-    verdict = _latest_review_comment(owner, repo, pr_num)
-    stamp = REVIEWED_SHA_RE.search(verdict[1].get("body") or "") if verdict else None
-    if stamp and _have(root, stamp.group(1)):
+    An unmatched prior verdict — unstamped, carrying a stamp format this engine
+    retired, or from another model — or an unreachable one yields the cold
+    baseline: the full PR diff, re-reviewed once. [LAW:no-silent-failure] that
+    is the conservative direction — always err toward running a review, never
+    toward skipping one — and the one-time cost of retiring a stamp format,
+    accepted up front."""
+    verdict = _latest_review_comment(owner, repo, pr_num, model)
+    stamp = VERDICT_RE.search(verdict[1].get("body") or "") if verdict else None
+    if stamp and _have(root, stamp.group(2)):
         comment = verdict[1]
         return Baseline(
-            sha=_resolve(root, stamp.group(1)),
+            sha=_resolve(root, stamp.group(2)),
             standing=comment.get("body") or "",
             since=comment.get("created_at") or "",
         )
@@ -407,25 +435,31 @@ def _baseline(owner: str, repo: str, pr_num: int, root: str, head: str) -> Basel
 
 def _human_replies(owner: str, repo: str, pr_num: int, since: str) -> str:
     """PR discussion the reviewer has not already seen: comments posted after
-    `since`, minus the reviewer's own exhaust.
+    `since`, minus the engine's own exhaust.
 
     Two classes of comment are dropped because feeding them back costs tokens and
     actively degrades the review. A trigger MARKER carries no information at all.
     A superseded VERDICT is worse than noise: it lists findings that have since
-    been fixed, and a reviewer reading them re-raises settled concerns. The
-    verdict that still matters — the newest one — reaches the model as
-    `Baseline.standing`, once. [LAW:one-source-of-truth]
+    been fixed, and a reviewer reading them re-raises settled concerns. That
+    drop is deliberately NOT model-scoped — a superseded verdict from ANY model
+    is that noise, so all of them go. The verdict that still matters — this
+    model's newest — reaches the model as `Baseline.standing`, once.
+    [LAW:one-source-of-truth]
 
-    Filtering keys on the engine's own machine-readable stamps, never on marker
-    prose, so it holds for every provider's wording — a provider can reword its
-    marker freely without silently breaking this filter, which is precisely what
-    a prose match would do.
+    Filtering keys on the engine's own machine-readable stamps, never on prose —
+    not on marker wording, and not on the `REVIEW_COMPLETE` trailer, which is
+    the model's contract and therefore text a HUMAN can legitimately quote. A
+    human comment quoting the trailer is a reply the reviewer must see;
+    matching prose here is what silently swallowed one. [LAW:no-silent-failure]
 
-    One bounded gap: markers posted before `MARKER_TOKEN` existed carry no token.
-    A warm pass drops them anyway (they predate `since`), but a cold pass on such
-    a PR still carries them once. Matching the old prose instead would trade a
-    permanent fragile match for a shrinking historical cost, so it is left
-    alone."""
+    One bounded gap: markers posted before `MARKER_TOKEN` existed carry no
+    token, and verdict-shaped comments this engine did not stamp — the CI
+    opencode provider's trailer-only verdicts, or a retired local stamp
+    format — are no longer recognized here. A warm pass drops them anyway
+    (they predate `since`), but a cold pass on such a PR still carries them
+    once. Matching the old prose instead would trade a permanent fragile match
+    — one that eats human replies quoting it — for a shrinking historical
+    cost, so it is left alone."""
     issue = _gh_json(
         "api", f"repos/{owner}/{repo}/issues/{pr_num}/comments?per_page=100",
         "--jq", "[.[] | {author: .user.login, body, created_at}]",
@@ -439,7 +473,7 @@ def _human_replies(owner: str, repo: str, pr_num: int, since: str) -> str:
         body = (c.get("body") or "").strip()
         if not body or (c.get("created_at") or "") <= since:
             continue
-        if MARKER_TOKEN in body or REVIEW_COMPLETE_RE.search(body):
+        if MARKER_TOKEN in body or VERDICT_RE.search(body):
             continue
         lines.append(f"@{c['author']}: {body[:4000]}")
     return "\n\n".join(lines)
@@ -527,22 +561,24 @@ def build_prompt(owner: str, repo: str, pr_num: int, root: str,
     return "\n\n".join(parts)
 
 
-def _stamp(review: str, sha: str) -> str:
-    """Record which commit this verdict judged, immediately above the trailer so
-    `REVIEW_COMPLETE: <N>` stays the last line the contract promises it is.
+def _stamp(review: str, model: str, sha: str) -> str:
+    """Record which model produced this verdict and which commit it judged,
+    immediately above the trailer so `REVIEW_COMPLETE: <N>` stays the last line
+    the contract promises it is.
 
-    [LAW:one-source-of-truth] this stamp is what makes the PR the single home of
-    the review baseline; the next pass reads it back in `_baseline`."""
+    [LAW:one-source-of-truth] this one stamp is the single home of verdict
+    identity — verdict-ness, producer, and judged commit — and what makes the PR
+    itself the record the next pass reads back in `_baseline` and `fetch`."""
     line = REVIEW_COMPLETE_RE.search(review)
     head, tail = review[:line.start()].rstrip(), review[line.start():]
-    return f"{head}\n\n{_reviewed_sha_stamp(sha)}\n\n{tail}"
+    return f"{head}\n\n{_verdict_stamp(model, sha)}\n\n{tail}"
 
 
 def _run_review(owner: str, repo: str, pr_num: int, runner: Runner,
                 root: str, baseline: Baseline, head: str) -> str:
     """Run the local review via the runner and return its text, validated to
-    carry the `REVIEW_COMPLETE` trailer and stamped with the commit it judged.
-    Pure compute plus the stamp: reads, never writes.
+    carry the `REVIEW_COMPLETE` trailer and stamped with the model and the
+    commit it judged. Pure compute plus the stamp: reads, never writes.
 
     [LAW:single-enforcer] the trailer check lives here, once, for every runner —
     a runner owns only its own exit/timeout handling; the verdict contract that
@@ -554,7 +590,7 @@ def _run_review(owner: str, repo: str, pr_num: int, runner: Runner,
             f"{runner.cli} review produced no `REVIEW_COMPLETE: <N>` trailer — the "
             "verdict is missing, not clean; do not treat this as a clean review."
         )
-    return _stamp(review, head)
+    return _stamp(review, runner.model, head)
 
 
 def _post_comment(owner: str, repo: str, pr_num: int, body: str,
@@ -578,12 +614,12 @@ def trigger(pr_url: str, runner: Runner) -> dict:
     """Ensure a current verdict exists for the PR's head commit.
 
     This is an idempotent upsert, not an unconditional run. A pass is warranted
-    when the author has pushed code since the last verdict, or has said something
-    new on the PR (a pushback deserves an answer — and without that second
-    condition the caller's loop would spin forever: the author argues, the
-    reviewer never re-runs, `fetch` returns the same open findings). When neither
-    is true, the standing verdict already covers this commit and re-running would
-    buy an identical answer at full price.
+    when the author has pushed code since this model's last verdict, or has said
+    something new on the PR (a pushback deserves an answer — and without that
+    second condition the caller's loop would spin forever: the author argues,
+    the reviewer never re-runs, `fetch` returns the same open findings). When
+    neither is true, this model's standing verdict already covers this commit
+    and re-running would buy an identical answer at full price.
 
     [LAW:effects-at-boundaries] the expensive effect is performed here at the
     edge, and the edge is the right place to decide whether it is needed at all —
@@ -592,12 +628,12 @@ def trigger(pr_url: str, runner: Runner) -> dict:
 
     The marker makes a real run observable on the PR the moment it starts —
     before the review (minutes) finishes — mirroring the visible /opencode
-    trigger comment. It carries no `REVIEW_COMPLETE` trailer, so fetch() never
-    mistakes it for the verdict."""
+    trigger comment. It carries no verdict stamp, so fetch() never mistakes it
+    for the verdict."""
     owner, repo, pr_num = github_threads.parse_pr(pr_url)
     root = _repo_root(owner, repo, pr_num)
     head = _resolve(root, github_threads.head_sha(owner, repo, pr_num))
-    baseline = _baseline(owner, repo, pr_num, root, head)
+    baseline = _baseline(owner, repo, pr_num, root, head, runner.model)
 
     if baseline.sha == head and not _human_replies(owner, repo, pr_num, baseline.since):
         return {"triggered": False, "comment_url": None, "reason": "verdict current"}
@@ -623,45 +659,64 @@ def wait(pr_url: str) -> dict:
     }
 
 
-def _latest_review_comment(owner: str, repo: str, pr_num: int):
-    """The current verdict: `(n, comment)` for the newest PR issue comment whose
-    body carries `REVIEW_COMPLETE: <N>`, or None if none exists.
+def _latest_review_comment(owner: str, repo: str, pr_num: int, model: str):
+    """The current verdict from `model`: `(n, comment)` for the newest PR issue
+    comment whose body carries a verdict stamp naming this model, or None if
+    none exists.
 
-    Keyed on the contract trailer, not on author, so the verdict is found
-    regardless of which account posted it. trigger() posts a fresh verdict
-    immediately before fetch() runs, so the newest such comment is always the
-    current review. [LAW:one-source-of-truth]"""
+    Keyed on the engine's verdict stamp — not on author, and not on the
+    contract trailer. The stamp is the one thing only the engine writes, so it
+    is the one thing that cannot be forged by prose; and it is model-scoped, so
+    the verdict read back is the one the matching configuration produced. The
+    count still comes from the `REVIEW_COMPLETE: <N>` trailer, the model's
+    contract. [LAW:no-silent-failure] a stamped comment with no trailer is a
+    verdict whose count is missing — not zero, and not skippable — so it halts.
+    trigger() posts a fresh verdict immediately before fetch() runs, so the
+    newest such comment is always the current review. [LAW:one-source-of-truth]
+    """
     comments = _gh_json(
         "api", f"repos/{owner}/{repo}/issues/{pr_num}/comments?per_page=100",
         "--jq", "[.[] | {author: .user.login, body, created_at}]",
     ) or []
     best = None  # (created_at, n, comment)
     for c in comments:
-        m = REVIEW_COMPLETE_RE.search(c.get("body") or "")
-        if not m:
+        m = VERDICT_RE.search(c.get("body") or "")
+        if not m or m.group(1) != model:
             continue
+        t = REVIEW_COMPLETE_RE.search(c.get("body") or "")
+        if not t:
+            raise RuntimeError(
+                f"Verdict comment by {c.get('author')} on {owner}/{repo}#{pr_num} "
+                f"carries {model}'s verdict stamp but no `REVIEW_COMPLETE: <N>` "
+                "trailer — the count is missing, not zero; do not treat this as "
+                "a clean review."
+            )
         if best is None or c["created_at"] > best[0]:
-            best = (c["created_at"], int(m.group(1)), c)
+            best = (c["created_at"], int(t.group(1)), c)
     if best is None:
         return None
     return best[1], best[2]
 
 
-def fetch(pr_url: str) -> dict:
-    """Return the current review's pending findings in canonical form.
+def fetch(pr_url: str, runner: Runner) -> dict:
+    """Return the current review's pending findings in canonical form — the
+    verdict read back being the one `runner.model` produced: each provider
+    module passes its own `RUNNER` through, so a provider never reads another
+    model's verdict as its own.
 
     [LAW:verifiable-goals] `N == 0` is the one signal that establishes 'clean'
     and ends the skill's loop. While `N > 0`, the whole verdict comment is one
     unresolved finding carrying every concern; the author addresses them,
     re-triggers, and the next review's N is the convergence signal.
 
-    [LAW:no-silent-failure] no `REVIEW_COMPLETE` verdict means the review never
-    ran (or its comment was dropped) — halt; never read it as a clean pass."""
+    [LAW:no-silent-failure] no stamped verdict from this model means the review
+    never ran (or its comment was dropped) — halt; never read it as a clean
+    pass."""
     owner, repo, pr_num = github_threads.parse_pr(pr_url)
-    verdict = _latest_review_comment(owner, repo, pr_num)
+    verdict = _latest_review_comment(owner, repo, pr_num, runner.model)
     if verdict is None:
         raise RuntimeError(
-            f"No REVIEW_COMPLETE verdict comment on {owner}/{repo}#{pr_num} — "
+            f"No verdict comment from {runner.model} on {owner}/{repo}#{pr_num} — "
             "call provider.trigger(pr_url) first; do not treat this as a clean, "
             "zero-finding pass."
         )

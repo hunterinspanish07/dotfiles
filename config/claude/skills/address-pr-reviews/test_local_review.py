@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Behavior tests for the local PR-review engine's verdict identity.
+
+The engine identifies its own artifacts by stamps only it writes: a comment is
+an engine verdict because it carries the verdict stamp
+`<!-- pr-review:verdict model="..." sha="..." -->` — never because its prose
+mentions `REVIEW_COMPLETE`, which any human can quote. These tests pin the
+behaviors that depend on that: `_human_replies` must not swallow human replies
+that quote the trailer, `_latest_review_comment` must be scoped to the asking
+model's stamp and must halt on a stamp with no count, legacy stamps must match
+nothing, and the stamp/trailer round-trip must hold.
+
+[LAW:behavior-not-structure] every test asserts observable output — what
+`_human_replies` returns, what `_latest_review_comment` finds or raises, what
+`_stamp` emits — never call order or private plumbing. Fixture comments carry
+the stamps LITERALLY, not via `_verdict_stamp`, so a broken stamper cannot
+pass its own round-trip.
+
+[LAW:effects-at-boundaries] the one effect in the code under test — the `gh`
+API read — is stubbed at its boundary: `local_review._gh_json` is monkeypatched
+to return fixture lists shaped exactly like the real `--jq` projection
+(`{"author", "body", "created_at"}`). No `gh`, no network, no git.
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(__file__))
+
+import pytest
+
+import local_review
+
+# Two distinct reviewing configurations, as a Runner's `model` names them.
+MODEL_A = "xai/grok-4.6"
+MODEL_B = "openrouter/z-ai/glm-5.3"
+
+HEAD_SHA = "0123456789abcdef0123456789abcdef01234567"
+BASE_SHA = "89abcdef0123456789abcdef0123456789abcdef"
+
+
+def _comment(author: str, body: str, created_at: str) -> dict:
+    """One PR comment in the exact shape the engine's `--jq` projection reads."""
+    return {"author": author, "body": body, "created_at": created_at}
+
+
+def _verdict_body(model: str, sha: str, count: int) -> str:
+    """A verdict comment body as the engine posts it: findings, the verdict
+    stamp, then the trailer as the last line."""
+    return (
+        f"Findings from {model} on {sha[:8]}.\n\n"
+        f'<!-- pr-review:verdict model="{model}" sha="{sha}" -->\n\n'
+        f"REVIEW_COMPLETE: {count}"
+    )
+
+
+def _issue_comments(monkeypatch, comments: list) -> None:
+    """Point the engine's PR-comment read at a fixture: issue comments return
+    `comments`; review-thread comments (the other endpoint `_human_replies`
+    reads) return none. Mirrors the real `_gh_json` seam — same arguments, same
+    list-of-dicts shape — so the code under test runs unmodified."""
+
+    def stub(*args: str):
+        assert args[0] == "api", f"unexpected gh call: {args}"
+        return comments if "/issues/" in args[1] else []
+
+    monkeypatch.setattr(local_review, "_gh_json", stub)
+
+
+# --- _human_replies: what the reviewer's prompt carries -----------------------
+
+
+def test_human_reply_quoting_the_trailer_is_returned(monkeypatch):
+    # Bug 2, hit live on PR #144: a human comment quoting `REVIEW_COMPLETE: 0`
+    # is a reply the reviewer must see. Keying the drop on that prose silently
+    # swallowed it; the drop must key on the engine's stamp instead.
+    _issue_comments(monkeypatch, [
+        _comment(
+            "alice",
+            "I think we're done here — the last pass ended REVIEW_COMPLETE: 0, "
+            "so please double-check the remaining edge case before merge.",
+            "2026-08-29T10:00:00Z",
+        ),
+    ])
+    replies = local_review._human_replies("owner", "repo", 144, "")
+    assert "@alice:" in replies
+    assert "remaining edge case" in replies
+
+
+def test_stamped_verdict_comment_is_not_returned(monkeypatch):
+    _issue_comments(monkeypatch, [
+        _comment("github-actions[bot]", _verdict_body(MODEL_A, HEAD_SHA, 2),
+                 "2026-08-29T10:00:00Z"),
+    ])
+    assert local_review._human_replies("owner", "repo", 1, "") == ""
+
+
+def test_marker_comment_is_not_returned(monkeypatch):
+    _issue_comments(monkeypatch, [
+        _comment("github-actions[bot]",
+                 "🔍 **Grok reviewer triggered** — verdict to follow.\n\n"
+                 "<!-- pr-review:marker -->",
+                 "2026-08-29T10:00:00Z"),
+    ])
+    assert local_review._human_replies("owner", "repo", 1, "") == ""
+
+
+# --- _latest_review_comment: whose verdict this is ----------------------------
+
+
+def test_other_models_verdict_is_not_this_models_verdict(monkeypatch):
+    # Bug 1: a verdict from a different model must never stand in for this
+    # model's — otherwise the cheap reviewer's pass blocks the strong one from
+    # ever running, and the operator believes the strong model verified.
+    _issue_comments(monkeypatch, [
+        _comment("github-actions[bot]", _verdict_body(MODEL_B, HEAD_SHA, 0),
+                 "2026-08-29T10:00:00Z"),
+    ])
+    assert local_review._latest_review_comment("owner", "repo", 1, MODEL_A) is None
+
+
+def test_each_model_reads_back_its_own_newest_verdict(monkeypatch):
+    # Model B's newer verdict must not shadow model A's own verdict when A is
+    # the reviewer being run.
+    _issue_comments(monkeypatch, [
+        _comment("github-actions[bot]", _verdict_body(MODEL_A, BASE_SHA, 3),
+                 "2026-08-28T10:00:00Z"),
+        _comment("github-actions[bot]", _verdict_body(MODEL_B, HEAD_SHA, 1),
+                 "2026-08-29T10:00:00Z"),
+    ])
+    n, comment = local_review._latest_review_comment("owner", "repo", 1, MODEL_A)
+    assert n == 3
+    assert comment["body"] == _verdict_body(MODEL_A, BASE_SHA, 3)
+
+
+def test_legacy_stamp_is_a_verdict_for_no_model(monkeypatch):
+    # The retired stamp format matches nothing: cold baseline, full PR
+    # re-reviewed once — err toward running a review, never toward skipping.
+    _issue_comments(monkeypatch, [
+        _comment(
+            "github-actions[bot]",
+            f"Old-format verdict.\n\n"
+            f"<!-- pr-review:reviewed-sha: {HEAD_SHA} -->\n\n"
+            f"REVIEW_COMPLETE: 1",
+            "2026-08-29T10:00:00Z",
+        ),
+    ])
+    for model in (MODEL_A, MODEL_B):
+        assert local_review._latest_review_comment("owner", "repo", 1, model) is None
+
+
+def test_stamped_verdict_without_trailer_halts(monkeypatch):
+    # A verdict stamp with no count is a broken engine artifact — halt loudly,
+    # never read it as zero and never skip past it.
+    _issue_comments(monkeypatch, [
+        _comment(
+            "github-actions[bot]",
+            f"Findings, but the count never landed.\n\n"
+            f'<!-- pr-review:verdict model="{MODEL_A}" sha="{HEAD_SHA}" -->',
+            "2026-08-29T10:00:00Z",
+        ),
+    ])
+    with pytest.raises(RuntimeError, match="REVIEW_COMPLETE"):
+        local_review._latest_review_comment("owner", "repo", 1, MODEL_A)
+
+
+# --- the stamp itself ---------------------------------------------------------
+
+
+def test_stamp_keeps_the_trailer_last_and_carries_the_verdict_stamp():
+    stamped = local_review._stamp(
+        "Finding 1: the seam is rough.\n\nREVIEW_COMPLETE: 1", MODEL_A, HEAD_SHA
+    )
+    assert stamped.splitlines()[-1] == "REVIEW_COMPLETE: 1"
+    m = local_review.VERDICT_RE.search(stamped)
+    assert m, "the verdict stamp must be findable in the stamped review"
+    assert m.group(1) == MODEL_A
+    assert m.group(2) == HEAD_SHA
+
+
+def test_verdict_stamp_round_trips():
+    m = local_review.VERDICT_RE.search(local_review._verdict_stamp(MODEL_B, HEAD_SHA))
+    assert m
+    assert (m.group(1), m.group(2)) == (MODEL_B, HEAD_SHA)

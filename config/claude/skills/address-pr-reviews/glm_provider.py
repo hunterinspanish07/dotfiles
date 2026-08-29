@@ -51,7 +51,7 @@ def wait(pr_url: str) -> dict:
 
 
 def fetch(pr_url: str) -> dict:
-    return local_review.fetch(pr_url)
+    return local_review.fetch(pr_url, RUNNER)
 
 
 if __name__ == "__main__":
