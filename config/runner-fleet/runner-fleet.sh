@@ -28,12 +28,11 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPEC="${RUNNER_FLEET_SPEC:-$DIR/fleet.conf}"
 LOG_FILE="${RUNNER_FLEET_LOG:-$HOME/.local/share/runner-fleet/fleet.log}"
-# How long a freshly created runner must hold still before we call the create a success.
-# This is a verification window with an owner and a stated meaning — "did it survive its
-# own startup" — not a settle-sleep papering over a race. A runner poisoned the way this
-# fleet was poisoned exits 127 within a second or two, so a container that is still up
-# and has never restarted after this long really did start. [LAW:no-ambient-temporal-coupling]
-SETTLE_SECS="${RUNNER_FLEET_SETTLE:-25}"
+# How long to wait for a freshly created runner to register. A verification window with an
+# owner and a stated meaning — "did it get all the way to listening for jobs" — not a
+# settle-sleep papering over a race: the wait ends the moment the evidence arrives, and
+# only the failure path spends the whole budget. [LAW:no-ambient-temporal-coupling]
+SETTLE_SECS="${RUNNER_FLEET_SETTLE:-60}"
 
 # Uniform across every runner, so they are not columns in the spec. A runner that needed
 # a different value here would be a different KIND of runner, and that is a schema
@@ -100,23 +99,68 @@ index_of() {
 }
 
 # --- one definition of what state a runner is in ------------------------------
-# Four states, each with a distinct meaning and a distinct response. `healthy` covers
-# BOTH running and cleanly-exited, because an ephemeral runner legitimately exits 0
-# between jobs and waits for --restart=always to re-register it; calling that "down"
-# would make `up` churn a perfectly good runner on every invocation.
-# (runner-guard applies the same atomic predicate — last exit non-zero AND not running —
-# but over a two-sample window, because it is asking the different question "is this a
-# PERSISTENT crash loop"; this one asks "what is it right now".)
-runner_state() {
-  local name="$1" s
-  s=$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}} {{.HostConfig.RestartPolicy.Name}}' "$name" 2>/dev/null) || { printf 'absent'; return; }
-  local status exitcode policy
-  read -r status exitcode policy <<< "$s"
-  # Parked by runner-guard (policy dropped to 'no'): the container is deliberately not
-  # coming back on its own, so from the fleet's point of view it is broken and needs
-  # replacing — which is precisely the handoff the guard's circuit-break intends.
-  if [[ "$policy" != "always" ]]; then printf 'broken'; return; fi
-  if [[ "$status" == "running" || "$exitcode" -eq 0 ]]; then printf 'healthy'; else printf 'broken'; fi
+# Classifies every SELECTED runner into STATES[], sampling at BOTH ENDS of a window.
+#
+# Two wrong versions of this preceded the right one, and both wrong ones are worth
+# naming. A single point-in-time sample called odyssey-runner "healthy" mid-crash-loop,
+# because the instant it was asked fell inside one of the restarts and the container
+# really was `running` — running its own doomed entrypoint. Replacing that with a restart
+# COUNT DELTA was worse: it flagged a perfectly healthy ht-runner as looping (an ephemeral
+# runner legitimately exits and restarts after every job it finishes) while calling a
+# genuinely dead odyssey-runner healthy, because Docker's exponential backoff had stretched
+# its restart interval past the sampling window. A rate signal has a false negative exactly
+# on the worst cases, which is the property you least want in this measurement.
+#
+# What actually separates the two is PERSISTENCE of the unhealthy condition, not its rate:
+# unhealthy == last exit non-zero AND not currently running, and it has to hold at both
+# ends of the window. A healthy runner is always either running or cleanly exited between
+# jobs, so it can never satisfy that; a crash-loop satisfies it continuously however slowly
+# Docker is resurrecting it. (This is the same predicate runner-guard uses, arrived at the
+# same way — see its header. It was written down there before this file existed, and
+# rediscovering it the hard way is the argument for reading it.)
+# [FRAMING:representation] [LAW:no-silent-failure]
+#
+# The states are exhaustive and each carries its own response, so callers branch on a
+# value rather than re-deriving the question:
+#   absent    no such container
+#   parked    restart policy is not `always` — runner-guard circuit-broke it deliberately
+#   looping   unhealthy at both ends of the window: a live crash-loop
+#   settling  unhealthy at exactly one end: mid-transition, not yet a verdict
+#   healthy   running, or cleanly exited between jobs
+# [LAW:types-are-the-program]
+STATE_SAMPLE_SECS="${RUNNER_FLEET_SAMPLE:-6}"
+STATES=()
+classify_selected() {
+  local i s status exitcode policy n
+  local unhealthy0=()
+  for i in "${SELECTED[@]}"; do
+    if s=$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "${R_NAME[$i]}" 2>/dev/null); then
+      read -r status exitcode <<< "$s"
+      if [[ "$exitcode" -ne 0 && "$status" != "running" ]]; then unhealthy0+=("1"); else unhealthy0+=("0"); fi
+    else
+      unhealthy0+=("absent")
+    fi
+  done
+  # One sleep for the whole batch, not one per runner: the window is a property of the
+  # measurement, not of any single container.
+  sleep "$STATE_SAMPLE_SECS"
+  STATES=(); n=0
+  for i in "${SELECTED[@]}"; do
+    if ! s=$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}} {{.HostConfig.RestartPolicy.Name}}' "${R_NAME[$i]}" 2>/dev/null); then
+      STATES+=("absent"); n=$((n+1)); continue
+    fi
+    read -r status exitcode policy <<< "$s"
+    if [[ "$policy" != "always" ]]; then
+      STATES+=("parked")
+    elif [[ "$status" == "running" || "$exitcode" -eq 0 ]]; then
+      STATES+=("healthy")
+    elif [[ "${unhealthy0[$n]}" == "1" ]]; then
+      STATES+=("looping")
+    else
+      STATES+=("settling")
+    fi
+    n=$((n+1))
+  done
 }
 
 require_docker() {
@@ -125,14 +169,23 @@ require_docker() {
 }
 
 # --- create ---------------------------------------------------------------
+# Sets IMAGE_DIGEST rather than printing it. Returning it on stdout would put this
+# function's stdout on two duties at once — progress for a human and a value for the
+# caller — and log() writes to stdout, so `$(resolve_image)` captured the log line INTO
+# the image reference and handed docker a multi-line ref. One channel, one meaning.
+# (CLI binding: stdout vs stderr semantics are a design decision, not an accident.)
+IMAGE_DIGEST=""
 resolve_image() {
   log "pulling $IMAGE_SPEC to resolve an immutable digest"
   docker pull "$IMAGE_SPEC" >/dev/null || die "docker pull $IMAGE_SPEC failed"
-  local digest
-  digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE_SPEC") \
+  IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE_SPEC") \
     || die "could not read RepoDigests for $IMAGE_SPEC"
-  [[ -n "$digest" ]] || die "empty digest for $IMAGE_SPEC"
-  printf '%s' "$digest"
+  # Validate the shape before it flows downstream. An external command's output is an
+  # assertion about the world until something checks it; unchecked, a malformed value
+  # surfaces as `docker: invalid reference format` one call later, with the actual
+  # mistake nowhere in the error. [LAW:no-silent-failure]
+  [[ "$IMAGE_DIGEST" == *"@sha256:"* && "$IMAGE_DIGEST" != *$'\n'* ]] \
+    || die "expected a single 'repo@sha256:...' digest for $IMAGE_SPEC, got: $IMAGE_DIGEST"
 }
 
 # The bind source lives inside the Colima VM, not on macOS, so it has to be created
@@ -177,7 +230,16 @@ create_runner() {
 
   ensure_workdir "$wd"
 
-  log "removing any existing $name"
+  # Stop before removing, and give it time. `docker rm -f` alone sends SIGKILL, which
+  # skips the entrypoint's EXIT trap — the one that deregisters the runner with GitHub —
+  # and leaves a live session behind under the same RUNNER_NAME. The replacement then
+  # registers fine, connects fine, and spins forever on "A session for this runner
+  # already exists. Runner connect error: Conflict", which looks nothing like the
+  # ungraceful teardown that actually caused it. Observed doing exactly that to
+  # odyssey-runner on 2026-09-04. SIGTERM first, so the runner hangs up on its own.
+  # [LAW:no-ambient-temporal-coupling]
+  log "removing any existing $name (graceful stop first, so it deregisters)"
+  docker stop -t 30 "$name" >/dev/null 2>&1 || true
   docker rm -f "$name" >/dev/null 2>&1 || true
 
   log "creating $name (repo ${R_REPO[$i]}, workdir $wd, auto-update OFF)"
@@ -200,26 +262,42 @@ create_runner() {
 # alive after its own startup. The whole outage this script answers began with a
 # container that existed, reported "Up", and was dead. Report the result of a check that
 # was actually run. [LAW:verifiable-goals]
+# A create is done when the runner is REGISTERED AND LISTENING, not when docker returns
+# an id. The distinction is not academic: odyssey-runner was created successfully, stayed
+# `running`, and sat forever in "Obtaining the token of the runner" because its PAT no
+# longer worked — a container that is up and useless, which no amount of inspecting its
+# state can distinguish from one that is up and working. The runner's own log is the only
+# place that fact exists, so that is where it is read from. If a future image changes this
+# wording the check fails CLOSED and names the string it looked for, which is a diagnosable
+# five-second fix; the alternative — assuming success when the evidence is missing — is
+# how a dead fleet reports itself healthy. [LAW:verifiable-goals] [LAW:no-silent-failure]
+READY_MARKER="Listening for Jobs"
 verify_runner() {
-  local name="$1" waited=0 st rc
+  local name="$1" waited=0 s status exitcode rc
   while [[ "$waited" -lt "$SETTLE_SECS" ]]; do
     sleep 5; waited=$((waited+5))
-    st="$(runner_state "$name")"
-    rc=$(docker inspect -f '{{.RestartCount}}' "$name" 2>/dev/null || echo "?")
-    if [[ "$st" == "broken" ]]; then
-      warn "VERIFY FAILED: $name is $st after ${waited}s (restarts $rc). Last log lines:"
+    if ! s=$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}} {{.RestartCount}}' "$name" 2>/dev/null); then
+      warn "VERIFY FAILED: $name disappeared ${waited}s after creation"
+      return 1
+    fi
+    read -r status exitcode rc <<< "$s"
+    # Any restart inside the settle window is disqualifying. A runner that has just been
+    # created has no legitimate reason to restart — the ephemeral exit-0 cycle only
+    # happens after it has actually run a job — so a moving count here is the crash-loop.
+    if [[ "$rc" -gt 0 ]]; then
+      warn "VERIFY FAILED: $name restarted $rc times within ${waited}s — it is looping. Last log lines:"
       docker logs --tail 15 "$name" 2>&1 | sed 's/^/    /' >&2
       return 1
     fi
+    if docker logs "$name" 2>&1 | grep -q "$READY_MARKER"; then
+      log "verified: $name registered and is listening for jobs (${waited}s, 0 restarts)"
+      return 0
+    fi
   done
-  rc=$(docker inspect -f '{{.RestartCount}}' "$name" 2>/dev/null || echo "?")
-  if [[ "$rc" != "0" ]]; then
-    warn "VERIFY FAILED: $name restarted $rc times within ${SETTLE_SECS}s — it is looping. Last log lines:"
-    docker logs --tail 15 "$name" 2>&1 | sed 's/^/    /' >&2
-    return 1
-  fi
-  log "verified: $name held healthy for ${SETTLE_SECS}s with 0 restarts"
-  return 0
+  warn "VERIFY FAILED: $name never logged '$READY_MARKER' within ${SETTLE_SECS}s (status ${status}, restarts ${rc})."
+  warn "  Most often this is the PAT: it must be a fine-grained token for that repo with Administration: Read & write."
+  docker logs --tail 15 "$name" 2>&1 | sed 's/^/    /' >&2
+  return 1
 }
 
 # --- commands -----------------------------------------------------------------
@@ -244,14 +322,19 @@ select_runners() {
 
 cmd_status() {
   select_runners "$@"
-  local i st rc img degraded=0
-  printf '%-18s %-10s %-9s %s\n' CONTAINER STATE RESTARTS IMAGE
+  classify_selected
+  local n=0 i st rc img degraded=0
+  # STATE is container liveness — it does NOT assert that GitHub can see the runner. A
+  # runner can be `healthy` here and unregistered (see verify_runner). Say what is
+  # measured; never let the column imply more than the measurement supports.
+  printf '%-18s %-9s %-9s %s\n' CONTAINER STATE RESTARTS IMAGE
   for i in "${SELECTED[@]}"; do
-    st="$(runner_state "${R_NAME[$i]}")"
+    st="${STATES[$n]}"
     rc=$(docker inspect -f '{{.RestartCount}}' "${R_NAME[$i]}" 2>/dev/null || echo -)
     img=$(docker inspect -f '{{.Config.Image}}' "${R_NAME[$i]}" 2>/dev/null | sed 's/.*@sha256:/sha256:/' | cut -c1-19 || echo -)
-    printf '%-18s %-10s %-9s %s\n' "${R_NAME[$i]}" "$st" "$rc" "${img:--}"
+    printf '%-18s %-9s %-9s %s\n' "${R_NAME[$i]}" "$st" "$rc" "${img:--}"
     [[ "$st" == "healthy" ]] || degraded=1
+    n=$((n+1))
   done
   return $(( degraded * 3 ))
 }
@@ -271,13 +354,15 @@ cmd_up() {
   local force=0
   [[ "${1:-}" == "--force" ]] && { force=1; shift; }
   select_runners "$@"
-  local i st image failed=0 acted=0
+  classify_selected
+  local i st image failed=0 acted=0 n=0
   # Resolve the image ONCE for the whole run, so every runner created by one invocation
   # is the same build — not whatever the registry served between two pulls.
-  image="$(resolve_image)"
+  resolve_image
+  image="$IMAGE_DIGEST"
   log "image resolved: $image"
   for i in "${SELECTED[@]}"; do
-    st="$(runner_state "${R_NAME[$i]}")"
+    st="${STATES[$n]}"; n=$((n+1))
     if [[ "$st" == "healthy" && "$force" -eq 0 ]]; then
       log "ok: ${R_NAME[$i]} is healthy; leaving it alone"
       continue
