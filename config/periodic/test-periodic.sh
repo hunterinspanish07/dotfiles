@@ -73,13 +73,37 @@ grep -q 'exit=3' "$HB2" && ok "heartbeat records the job's non-zero exit as data
 check "a failing job still reports the agent as ALIVE" "$?" "0"
 
 echo "== a hung cycle cannot stall the loop (KeepAlive's blind spot) =="
+# The hung command is a uniquely-named script rather than a bare `sleep 3600`, because
+# `pgrep -f 'sleep 3600'` matches any such process on the machine — including the killer
+# this very supervisor spawns for a real agent configured with --timeout 3600. That made
+# this assertion fail for a reason that had nothing to do with the code under test.
+# A test must observe its own subtree, not the host's. [LAW:behavior-not-structure]
 HB3="$TMP/hang.hb"
-"$PERIODIC" --label h --interval 1 --timeout 2 --heartbeat "$HB3" -- /bin/sleep 3600 >/dev/null 2>&1 &
+cat > "$TMP/hangs-forever.sh" <<'HANG'
+#!/bin/bash
+exec sleep 3600
+HANG
+chmod +x "$TMP/hangs-forever.sh"
+# A distinctive timeout so the killer's own sleep is identifiable among any others.
+KILLER_TIMEOUT=13
+"$PERIODIC" --label h --interval 1 --timeout "$KILLER_TIMEOUT" --heartbeat "$HB3" -- "$TMP/hangs-forever.sh" >/dev/null 2>&1 &
 P3=$!
-sleep 6
+sleep $(( KILLER_TIMEOUT + 6 ))
 kill "$P3" 2>/dev/null; wait "$P3" 2>/dev/null
+sleep 1
 if [[ -f "$HB3" ]] && grep -q 'exit=timeout' "$HB3"; then ok "hung cycle was killed and recorded as exit=timeout"; else no "hung cycle stalled the loop: $(cat "$HB3" 2>/dev/null || echo '(no heartbeat)')"; fi
-if pgrep -f 'sleep 3600' >/dev/null 2>&1; then no "the hung child leaked (still running)"; pkill -f 'sleep 3600'; else ok "the hung child was reaped, not leaked"; fi
+# Assert on the whole subtree via the unique temp path, not on the hung command's own
+# argv. The killer is a FORK of periodic.sh, so it carries the supervisor's full command
+# line — which contains this script's path — and matching that path alone cannot tell the
+# leaked child from the leaked killer from the supervisor itself. "Nothing from this run
+# survives" is both the stronger claim and the unambiguous one. [LAW:behavior-not-structure]
+survivors=$(pgrep -f "$TMP" 2>/dev/null | wc -l | tr -d ' ')
+if [[ "$survivors" -eq 0 ]]; then ok "nothing from this run survived the supervisor (child and killer both reaped)"; else no "$survivors process(es) from this run leaked"; pkill -f "$TMP" 2>/dev/null; fi
+# The killer subshell spawns `sleep <timeout>`; killing the subshell does NOT kill it, so
+# it survives reparented to init — one orphan per cycle, forever. Observed live as five
+# stray `sleep 900` under a running runner-guard.
+orphans=$(pgrep -x sleep 2>/dev/null | while read -r pid; do ps -o command= -p "$pid" 2>/dev/null | grep -qx "sleep $KILLER_TIMEOUT" && echo "$pid"; done | wc -l | tr -d ' ')
+if [[ "$orphans" -eq 0 ]]; then ok "the killer's own sleep was reaped (no orphan per cycle)"; else no "$orphans orphaned 'sleep $KILLER_TIMEOUT' left behind"; pkill -x -f "sleep $KILLER_TIMEOUT" 2>/dev/null; fi
 
 echo
 echo "passed: $pass   failed: $fail"

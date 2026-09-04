@@ -118,7 +118,24 @@ log() { printf '%s periodic[%s]: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$LABEL"
 # signal until it returned (up to a full interval of launchd waiting, then SIGKILL), so
 # the sleep runs in the background and we `wait` on it — that IS interruptible.
 running_pid=""
-terminate() { log "signalled; shutting down"; [[ -n "$running_pid" ]] && kill "$running_pid" 2>/dev/null; exit 0; }
+killer_pid=""
+# Shut down the whole cycle, not just the command. The killer is a forked subshell holding
+# its own `sleep`; killing only the command left BOTH of them running, reparented to init,
+# every time the agent was stopped or restarted — and because the fork inherits this
+# script's command line verbatim, the strays are indistinguishable from the supervisor in
+# `ps`, which is a fine way to spend an hour chasing the wrong process. Children before
+# parent: `pkill -P` against an already-dead parent matches nothing.
+terminate() {
+  log "signalled; shutting down"
+  if [[ -n "$killer_pid" ]]; then
+    pkill -P "$killer_pid" 2>/dev/null || true
+    kill "$killer_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$running_pid" ]]; then
+    kill "$running_pid" 2>/dev/null || true
+  fi
+  exit 0
+}
 trap terminate TERM INT
 
 log "starting: every ${INTERVAL}s, cycle timeout ${TIMEOUT}s, command: $*"
@@ -133,11 +150,20 @@ while true; do
   # a timeout is distinguishable from a command that merely exited 143 on its own.
   # [LAW:no-ambient-temporal-coupling]
   ( sleep "$TIMEOUT"; if kill -0 "$running_pid" 2>/dev/null; then : > "$marker"; kill -TERM "$running_pid" 2>/dev/null; sleep 5; kill -KILL "$running_pid" 2>/dev/null; fi ) & killer=$!
+  killer_pid="$killer"
 
   rc=0; wait "$running_pid" || rc=$?
   running_pid=""
+  # Kill the killer's OWN `sleep` before the killer, not just the killer. Killing the
+  # subshell leaves the sleep it spawned running, reparented to init — one orphan per
+  # cycle, which at a 120s interval and a 900s timeout means a steady handful of stray
+  # processes forever. Measured: five live `sleep 900` at ppid 1 after eleven minutes.
+  # Children first, because `pkill -P` on an already-dead parent finds nothing and the
+  # sleep is orphaned exactly as before. [LAW:no-silent-failure]
+  pkill -P "$killer" 2>/dev/null || true
   kill "$killer" 2>/dev/null || true
   wait "$killer" 2>/dev/null || true
+  killer_pid=""
 
   if [[ -f "$marker" ]]; then
     rc="timeout"
