@@ -32,8 +32,10 @@
 # EXIT CODES (a contract, per the CLI binding — each code a distinct outcome):
 #   0  --status only: the heartbeat is fresh (the supervisor is alive)
 #   1  --status only: the heartbeat is STALE or missing (the supervisor is NOT running)
-#   2  bad invocation, or the supervised command is missing/not executable — the
-#      supervisor cannot run at all. Never confused with "ran and the job failed":
+#   2  bad invocation, or the supervised EXECUTABLE is missing/not executable — the
+#      supervisor cannot run at all. (Only the executable: `COMMAND [ARG...]` does not say
+#      which argument, if any, is a script, so that check belongs to install-agent.sh,
+#      which reads the plist and knows.) Never confused with "ran and the job failed":
 #      a failing job is normal and is recorded IN the heartbeat, not in this exit code.
 # In loop mode the script does not exit on its own; it runs until signalled.
 set -euo pipefail
@@ -134,18 +136,20 @@ TIMEOUT="${TIMEOUT:-$INTERVAL}"
 # process launchd happily keeps alive while it accomplishes nothing — the exact shape of
 # the failure this file exists to end. [LAW:no-silent-failure]
 #
-# Both plists supervise via `-- /bin/bash <script>`, so checking only "$1" checked
-# /bin/bash — a test that cannot fail, standing in for the one that matters. A deleted
-# runner-guard.sh would have sailed past it and then failed every cycle forever, visible
-# only as exit=127 buried in heartbeat data rather than as the documented refusal to
-# start. Check the interpreter AND the script it is handed.
+# What is checkable HERE is the executable, and only the executable. An earlier attempt
+# also validated "the script" as `${@:$#}` — the last positional argument — which is a
+# false theorem about the documented `COMMAND [ARG...]` signature: the last argument is a
+# script only when the command happens to be `<interpreter> <script>` with nothing after
+# it. `-- /bin/echo hello` was rejected at startup because `hello` is not a readable file.
+# The type of `COMMAND [ARG...]` simply does not carry which argument is a path, so no
+# check written at this layer can know. [LAW:types-are-the-program]
+#
+# The stronger check — that the supervised *script* exists — lives in install-agent.sh,
+# which reads the plist and therefore knows the shape it is looking at. One enforcer, sited
+# where the information actually is, instead of a guess sited where it isn't.
+# [LAW:single-enforcer]
 command -v "$1" >/dev/null 2>&1 || [[ -x "$1" ]] \
   || { echo "periodic.sh: supervised command '$1' not found or not executable" >&2; exit 2; }
-SUPERVISED_SCRIPT="${@:$#}"
-if [[ "$SUPERVISED_SCRIPT" != "$1" ]]; then
-  [[ -r "$SUPERVISED_SCRIPT" ]] \
-    || { echo "periodic.sh: supervised script '$SUPERVISED_SCRIPT' not found or not readable" >&2; exit 2; }
-fi
 
 mkdir -p "$(dirname "$HEARTBEAT")" || true
 log() { printf '%s periodic[%s]: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$LABEL" "$*"; }
@@ -185,7 +189,13 @@ while true; do
   # no timeout(1), so this is it: a killer that races the command and leaves a marker so
   # a timeout is distinguishable from a command that merely exited 143 on its own.
   # [LAW:no-ambient-temporal-coupling]
-  ( sleep "$TIMEOUT"; if kill -0 "$running_pid" 2>/dev/null; then : > "$marker"; kill -TERM "$running_pid" 2>/dev/null; sleep 5; kill -KILL "$running_pid" 2>/dev/null; fi ) & killer=$!
+  # stderr silenced on the killer alone. Reaping its `sleep` makes bash announce
+  # "Terminated: 15  sleep" — once per cycle, which at runner-guard's 120s interval is 720
+  # lines of pure noise a day in launchd.err. An error log nobody reads because it is full
+  # of benign chatter is a log that cannot report the next real failure; the alarm has to
+  # stay quiet to stay meaningful. The subshell has no diagnostics of its own to lose — it
+  # only sleeps, tests, and kills.
+  ( sleep "$TIMEOUT"; if kill -0 "$running_pid" 2>/dev/null; then : > "$marker"; kill -TERM "$running_pid" 2>/dev/null; sleep 5; kill -KILL "$running_pid" 2>/dev/null; fi ) 2>/dev/null & killer=$!
   killer_pid="$killer"
 
   rc=0; wait "$running_pid" || rc=$?

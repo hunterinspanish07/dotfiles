@@ -54,42 +54,35 @@ while v=$(pget "ProgramArguments.$i"); do ARGS+=("$v"); i=$((i+1)); done
 
 # Pull the supervisor's own flags back out, so the installer verifies the SAME heartbeat
 # and interval the agent will actually use rather than a hardcoded guess at them.
-INTERVAL="" HEARTBEAT="" SUPERVISOR="" CMD=""
-seen_ddash=0
+INTERVAL="" HEARTBEAT="" SUPERVISOR="" CMD="" CMD_SCRIPT=""
+seen_ddash=0 DDASH_AT=-1
 for (( i=0; i<${#ARGS[@]}; i++ )); do
   case "${ARGS[$i]}" in
     --interval)  INTERVAL="${ARGS[$((i+1))]:-}" ;;
     --heartbeat) HEARTBEAT="${ARGS[$((i+1))]:-}" ;;
-    --)          seen_ddash=1 ;;
+    --)          seen_ddash=1; DDASH_AT="$i" ;;
   esac
 done
 SUPERVISOR="${ARGS[1]:-}"
-# The supervised command is written `-- /bin/bash <script>`, so the element straight after
-# `--` is the INTERPRETER, not the thing being supervised. Taking that one meant the
-# existence check below dutifully confirmed /bin/bash was present — which it always is —
-# and reported "runs: /bin/bash", while never checking the script that actually matters.
-# A check that cannot fail is not a check. The script is the last argument.
-# [LAW:verifiable-goals]
-CMD="${ARGS[$(( ${#ARGS[@]} - 1 ))]:-}"
+# Everything after `--` is the supervised command. This installer accepts exactly two
+# shapes, and says so, rather than guessing which argument is a file:
+#     -- <executable>                 e.g. -- /usr/local/bin/sweep
+#     -- <interpreter> <script>       e.g. -- /bin/bash /Users/.../runner-guard.sh
+# Both agents use the second. Naming the shapes is what makes the script checkable at all:
+# periodic.sh receives `COMMAND [ARG...]` and cannot know which argument is a path, so the
+# check lives here, where the plist has already committed to a shape.
+# [LAW:types-are-the-program] [LAW:single-enforcer]
+CMD_ARGS=()
+for (( j=DDASH_AT+1; j<${#ARGS[@]}; j++ )); do CMD_ARGS+=("${ARGS[$j]}"); done
+case ${#CMD_ARGS[@]} in
+  1) CMD="${CMD_ARGS[0]}"; CMD_SCRIPT="" ;;
+  2) CMD="${CMD_ARGS[1]}"; CMD_SCRIPT="${CMD_ARGS[1]}" ;;
+  *) echo "ERROR: $PLIST supervises ${#CMD_ARGS[@]} arguments after '--'; this installer handles '<executable>' or '<interpreter> <script>'" >&2; exit 1 ;;
+esac
 
 [[ -n "$HEARTBEAT" ]] || { echo "ERROR: $PLIST does not pass --heartbeat to periodic.sh; this installer only handles supervised agents" >&2; exit 1; }
 [[ -n "$INTERVAL"  ]] || { echo "ERROR: $PLIST does not pass --interval to periodic.sh" >&2; exit 1; }
 [[ "$seen_ddash" -eq 1 ]] || { echo "ERROR: $PLIST has no '--' separating periodic.sh's flags from the supervised command" >&2; exit 1; }
-
-# The agent runs the dotbot-linked runtime paths named in the plist, NOT this checkout.
-# Bootstrapping an agent whose scripts are not at those paths is a launchd job that fails
-# every cycle — the exact silent failure this whole change exists to end.
-# [LAW:no-silent-failure] [LAW:one-source-of-truth]
-for f in "$SUPERVISOR" "$CMD"; do
-  [[ -e "$f" ]] || {
-    echo "ERROR: $f is missing — run './install' from the dotfiles root first so the" >&2
-    echo "       ~/.config symlinks exist, then re-run this." >&2
-    exit 1
-  }
-done
-# The supervised script is invoked through /bin/bash by the plist, but a non-executable
-# file here almost always means a broken link rather than a deliberate choice.
-chmod +x "$SUPERVISOR" "$CMD" 2>/dev/null || true
 
 # Check required binaries against the EXACT PATH the agent will run with, read from the
 # plist so that PATH has one source. Validating the installer's ambient PATH instead
@@ -97,6 +90,29 @@ chmod +x "$SUPERVISOR" "$CMD" 2>/dev/null || true
 # /usr/local/bin, a Docker Desktop shim, asdf, …, none on the agent's fixed PATH).
 AGENT_PATH=$(pget EnvironmentVariables.PATH) \
   || { echo "ERROR: could not read agent PATH from $PLIST" >&2; exit 1; }
+
+# The agent runs the dotbot-linked runtime paths named in the plist, NOT this checkout.
+# Bootstrapping an agent whose scripts are not at those paths is a launchd job that fails
+# every cycle — the exact silent failure this whole change exists to end.
+# [LAW:no-silent-failure] [LAW:one-source-of-truth]
+missing() {
+  echo "ERROR: $1 is missing — run './install' from the dotfiles root first so the" >&2
+  echo "       ~/.config symlinks exist, then re-run this." >&2
+  exit 1
+}
+[[ -e "$SUPERVISOR" ]] || missing "$SUPERVISOR"
+# The interpreter (or bare executable) must resolve; a bare name is allowed to come from
+# the agent PATH, so ask `command -v` before insisting on a filesystem path.
+CMD_HEAD="${CMD_ARGS[0]}"
+PATH="$AGENT_PATH" command -v "$CMD_HEAD" >/dev/null 2>&1 || [[ -x "$CMD_HEAD" ]] || missing "$CMD_HEAD"
+# And when the plist committed to `<interpreter> <script>`, the script itself — the check
+# periodic.sh structurally cannot make, because `COMMAND [ARG...]` never says which
+# argument is a path. [LAW:single-enforcer]
+[[ -z "$CMD_SCRIPT" || -r "$CMD_SCRIPT" ]] || missing "$CMD_SCRIPT"
+# Invoked through an interpreter, so the exec bit is not strictly required — but a
+# non-executable file here almost always means a broken link rather than a choice.
+chmod +x "$SUPERVISOR" ${CMD_SCRIPT:+"$CMD_SCRIPT"} 2>/dev/null || true
+
 for bin in ${REQUIRED_BINS+"${REQUIRED_BINS[@]}"}; do
   PATH="$AGENT_PATH" command -v "$bin" >/dev/null \
     || { echo "ERROR: '$bin' not found on the agent PATH ($AGENT_PATH) — 'brew install $bin'?" >&2; exit 1; }

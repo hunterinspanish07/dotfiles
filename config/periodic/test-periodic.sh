@@ -26,11 +26,15 @@ check "zero interval exits 2" "$?" "2"
 check "non-numeric interval exits 2" "$?" "2"
 "$PERIODIC" --label x --interval 1 -- /bin/true >/dev/null 2>&1
 check "missing heartbeat exits 2" "$?" "2"
-# Both plists supervise via `-- /bin/bash <script>`, so a check that only looked at "$1"
-# only ever confirmed /bin/bash exists — it could not fail for the real usage shape, while
-# the script that actually matters went unchecked.
-"$PERIODIC" --label x --interval 1 --heartbeat "$TMP/hb" -- /bin/bash "$TMP/no-such-script.sh" >/dev/null 2>&1
-check "missing supervised SCRIPT (not just interpreter) exits 2" "$?" "2"
+# `COMMAND [ARG...]` does not say which argument is a path, so periodic.sh checks the
+# executable and nothing else. An earlier version validated "the last argument" as a script,
+# which rejected perfectly valid commands whose last argument is not a file — the check has
+# to be sited where the shape is actually known (install-agent.sh, which reads the plist).
+"$PERIODIC" --label x --interval 1 --heartbeat "$TMP/argcheck.hb" -- /bin/echo not-a-path >/dev/null 2>&1 &
+ARGPID=$!
+sleep 3
+if kill -0 "$ARGPID" 2>/dev/null; then ok "a command whose last arg is not a path still starts"; else no "a valid command with a non-path trailing arg was rejected at startup"; fi
+kill "$ARGPID" 2>/dev/null; wait "$ARGPID" 2>/dev/null
 
 echo "== status contract =="
 "$PERIODIC" --status --heartbeat "$TMP/absent" >/dev/null 2>&1
@@ -96,6 +100,18 @@ if [[ "$n2" -ge 2 ]]; then ok "loop survived a job exiting non-zero ($n2 cycles)
 grep -q 'exit=3' "$HB2" && ok "heartbeat records the job's non-zero exit as data" || no "heartbeat lost the exit code: $(cat "$HB2" 2>/dev/null)"
 "$PERIODIC" --status --heartbeat "$HB2" >/dev/null 2>&1
 check "a failing job still reports the agent as ALIVE" "$?" "0"
+
+echo "== a healthy agent keeps its error log empty =="
+# Reaping the timeout-killer's `sleep` makes bash announce "Terminated: 15" once per cycle
+# — 720 lines a day at runner-guard's interval. An error log full of benign chatter is one
+# nobody reads, which costs exactly the failure it was supposed to report.
+NOISE="$TMP/noise.err"
+"$PERIODIC" --label q --interval 1 --timeout 5 --heartbeat "$TMP/quiet.hb" -- /usr/bin/true >/dev/null 2>"$NOISE" &
+PQ=$!
+sleep 6
+kill "$PQ" 2>/dev/null; wait "$PQ" 2>/dev/null
+nlines=$(wc -l < "$NOISE" | tr -d ' ')
+if [[ "$nlines" -eq 0 ]]; then ok "several healthy cycles wrote nothing to stderr"; else no "$nlines line(s) of stderr noise across ~5 healthy cycles: $(head -1 "$NOISE")"; fi
 
 echo "== a hung cycle cannot stall the loop (KeepAlive's blind spot) =="
 # The hung command is a uniquely-named script rather than a bare `sleep 3600`, because
