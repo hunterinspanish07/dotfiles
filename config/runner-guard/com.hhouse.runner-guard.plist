@@ -1,11 +1,28 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- LaunchAgent: circuit-breaks crash-looping self-hosted CI runners, machine-wide.
+<!-- LaunchAgent: circuit-breaks (and now recreates) crash-looping self-hosted CI
+     runners, machine-wide.
      Install/stop: run ./install.sh in this directory (idempotent), or by hand:
        launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hhouse.runner-guard.plist
        launchctl bootout   gui/$(id -u)/com.hhouse.runner-guard
-     Paths are absolute by this repo's convention (single-user machine); the script is
-     the dotbot-linked ~/.config/runner-guard/runner-guard.sh. It DOES RunAtLoad (catch
-     a rogue at boot/login) and re-checks every 120s. -->
+     Paths are absolute by this repo's convention (single-user machine); the scripts are
+     the dotbot-linked ~/.config/{periodic,runner-guard}/.
+
+     WHY KeepAlive AND NOT StartInterval
+     This agent used to say `StartInterval 120`. It ran ONCE, on 2026-07-25, and never
+     again: `launchctl print` showed `runs = 1` with a permanently pended nondemand spawn
+     while a runner crash-looped 3,203 times underneath it, unnoticed for six weeks. Its
+     sibling com.hhouse.ci-janitor had the identical signature. A controlled A/B probe on
+     2026-09-04 settled the cause: a throwaway agent with `StartInterval 10` sat at
+     `runs = 0` for three minutes without firing once, while an otherwise identical agent
+     with `KeepAlive` ran continuously and ticked every 10s. launchd in this gui/501
+     domain honours a demand spawn (`launchctl kickstart`) but does not execute the
+     pended nondemand spawns an interval needs.
+
+     So the agent no longer asks launchd to start it 720 times a day. It asks launchd to
+     start it ONCE and keep it alive — the job launchd actually does — and periodic.sh
+     owns the clock from there, stamping a heartbeat every cycle so that a dead guard is
+     visible instead of merely quiet. install.sh refuses to finish until that heartbeat
+     has actually advanced. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -13,6 +30,21 @@
   <string>com.hhouse.runner-guard</string>
   <key>ProgramArguments</key>
   <array>
+    <string>/bin/bash</string>
+    <string>/Users/hhouse/.config/periodic/periodic.sh</string>
+    <string>--label</string>
+    <string>runner-guard</string>
+    <string>--interval</string>
+    <string>120</string>
+    <!-- One cycle may sample a 20s window and then recreate up to three runners, each
+         with a pull and a 25s verification hold. 900s is well clear of that, and still
+         bounds a cycle wedged on an unresponsive Docker socket — the hang KeepAlive
+         cannot see, because the process is alive while nothing is happening. -->
+    <string>--timeout</string>
+    <string>900</string>
+    <string>--heartbeat</string>
+    <string>/Users/hhouse/.local/share/runner-guard/heartbeat</string>
+    <string>--</string>
     <string>/bin/bash</string>
     <string>/Users/hhouse/.config/runner-guard/runner-guard.sh</string>
   </array>
@@ -28,8 +60,8 @@
   </dict>
   <key>RunAtLoad</key>
   <true/>
-  <key>StartInterval</key>
-  <integer>120</integer>
+  <key>KeepAlive</key>
+  <true/>
   <key>StandardOutPath</key>
   <string>/Users/hhouse/.local/share/runner-guard/launchd.out</string>
   <key>StandardErrorPath</key>

@@ -21,15 +21,18 @@
 # velocity: Docker's backoff throttles a long loop's restart rate toward zero, so a
 # rate signal misses exactly the worst cases. A rogue runner is strictly worse than no
 # runner (it delivers zero CI while pinning the shared VM), so the
-# heal is to STOP the loop and shout — never to silently paper over it, and never to
-# recreate the container (this guard does not own any project's PAT/repo/labels;
-# guessing them would be silent-wrong). [LAW:types-are-the-program] [LAW:no-silent-failure]
+# heal is to REPLACE it from the fleet spec — and, when that is impossible or does not
+# stick, to STOP the loop and shout. Never to silently paper over it. Recreation is safe
+# here only because runner-fleet's fleet.conf makes each runner's repo/labels/PAT a fact
+# this host owns rather than something to guess at, and only because it is bounded to one
+# attempt per cooldown. [LAW:types-are-the-program] [LAW:no-silent-failure]
 #
 # EXIT CODES (a contract, per the CLI binding — each code is a distinct outcome, never
 # a collapse of several):
 #   0  nothing actionable — every runner healthy, watching, parked, or none present
-#   1  a rogue was found and circuit-broken (in CHECK_ONLY: a rogue was DETECTED —
-#      advisory, nothing was stopped)
+#   1  a rogue was found and handled — either RECREATED from the fleet spec and verified
+#      healthy, or (when that is unavailable, on cooldown, or failed) circuit-broken. The
+#      log says which. (In CHECK_ONLY: a rogue was DETECTED — advisory, nothing touched.)
 #   2  the guard itself could not run (Docker unreachable) — NOT "all healthy"
 #   3  a rogue was found but the heal did NOT land — it is still live (act now)
 #   4  incomplete — a container could not be inspected, so this cycle's assessment is
@@ -54,6 +57,22 @@ LOG_FILE="${RUNNER_GUARD_LOG:-$HOME/.local/share/runner-guard/guard.log}"
 # the circuit-break instead of performing it. For operator status checks and for
 # verifying the classifier without touching the fleet. [LAW:effects-at-boundaries]
 CHECK_ONLY="${RUNNER_GUARD_CHECK_ONLY:-0}"
+# Healing a rogue means REPLACING it, which needs that runner's repo, labels and PAT.
+# This guard used to refuse on exactly that ground — it owned none of those facts, and
+# guessing them would have been silent-wrong. That was never an argument against healing;
+# it was an argument against healing without a source of truth. runner-fleet's fleet.conf
+# is now that source, so a recreate here is reading the spec, not guessing at it. If the
+# script is absent the guard loses nothing it previously had: it falls back to the
+# circuit-break it always did. [LAW:one-source-of-truth]
+FLEET_SCRIPT="${RUNNER_FLEET_SCRIPT:-$HOME/.config/runner-fleet/runner-fleet.sh}"
+# A recreate that does not address the cause (expired PAT, revoked repo access, a wedged
+# VM) would otherwise be retried every cycle — 720 registration attempts a day against
+# GitHub, a worse failure than the crash-loop it is trying to cure. One attempt per runner
+# per cooldown; after that the runner is circuit-broken and the operator is told, exactly
+# as before. The bound is what makes automatic recreation safe to run unattended.
+# [LAW:no-mode-explosion]
+HEAL_COOLDOWN_SECS="${RUNNER_GUARD_HEAL_COOLDOWN:-21600}"   # 6h
+HEAL_STATE_DIR="${RUNNER_GUARD_HEAL_STATE:-$HOME/.local/share/runner-guard/heals}"
 
 mkdir -p "$(dirname "$LOG_FILE")" || true
 # `|| true` on the tee: a logging effect (disk full, unwritable log) must NEVER abort
@@ -73,6 +92,42 @@ notify() {
   local msg="$1"
   osascript -e "display notification \"${msg//\"/\'}\" with title \"CI runner-guard\"" >/dev/null 2>&1 \
     || warn "note: desktop notification failed (osascript); alert is in $LOG_FILE"
+}
+
+# Attempts to replace a rogue runner from the fleet spec. Returns 0 only when the
+# replacement was VERIFIED up by runner-fleet (which holds it for a settle window and
+# checks it never restarted) — never merely because docker accepted the command. Every
+# other outcome returns non-zero and the caller falls through to the circuit-break, so a
+# failed heal can never be mistaken for a fixed runner. [LAW:verifiable-goals]
+heal_by_recreate() {
+  local name="$1" marker="$HEAL_STATE_DIR/$name" age now mtime
+
+  [[ -x "$FLEET_SCRIPT" ]] || { log "  heal unavailable: no runner-fleet at $FLEET_SCRIPT"; return 1; }
+  # Only runners the spec actually describes can be recreated from it. One that is not in
+  # fleet.conf is a container this host holds no authoritative definition for, and
+  # inventing one is the silent-wrong guess this guard has always refused to make.
+  "$FLEET_SCRIPT" plan "$name" >/dev/null 2>&1 || { log "  heal skipped: $name is not in the fleet spec"; return 1; }
+
+  mkdir -p "$HEAL_STATE_DIR" 2>/dev/null || true
+  if [[ -f "$marker" ]]; then
+    now=$(date +%s); mtime=$(stat -f %m "$marker" 2>/dev/null || echo 0); age=$(( now - mtime ))
+    if [[ "$age" -lt "$HEAL_COOLDOWN_SECS" ]]; then
+      warn "  heal on COOLDOWN for $name (last attempt ${age}s ago, cooldown ${HEAL_COOLDOWN_SECS}s) — a recreate did not stick, so the cause is not the container. Circuit-breaking instead."
+      return 1
+    fi
+  fi
+  # Stamped BEFORE the attempt, never after: if this cycle dies mid-recreate, the next one
+  # must still see that an attempt was spent. Recording it on success only would turn
+  # every crash during a heal into an unbounded retry loop.
+  # [LAW:no-ambient-temporal-coupling]
+  : > "$marker" 2>/dev/null || true
+
+  log "  healing $name: recreating from the fleet spec"
+  if "$FLEET_SCRIPT" up --force "$name" >>"$LOG_FILE" 2>&1; then
+    return 0
+  fi
+  warn "  heal FAILED for $name — runner-fleet could not verify a replacement (see $LOG_FILE)"
+  return 1
 }
 
 # --- discover the fleet -------------------------------------------------------
@@ -205,7 +260,15 @@ for i in "${!runners[@]}"; do
   elif [[ "$CHECK_ONLY" != "0" ]]; then
     # Read-only: a rogue exists but we touch nothing. Advisory exit 1, never "stopped".
     rogue_found=1
-    warn "ROGUE: $name — status ${status}, exit ${exit1}, unhealthy ${WINDOW_SECS}s+ (total restarts ${rc1}); WOULD circuit-break (CHECK_ONLY)"
+    warn "ROGUE: $name — status ${status}, exit ${exit1}, unhealthy ${WINDOW_SECS}s+ (total restarts ${rc1}); WOULD recreate from the fleet spec, else circuit-break (CHECK_ONLY)"
+  elif heal_by_recreate "$name"; then
+    # Replaced and verified. This is the outcome the guard existed to make possible and
+    # could not previously reach: CI comes back on its own, in minutes, with nobody
+    # watching. Counted as a handled rogue (exit 1) — the contract says "found and
+    # handled", and the log says which way it was handled.
+    rogue_found=1
+    warn "HEALED: $name was crash-looping and has been recreated from the fleet spec, verified healthy."
+    notify "Healed runner ${name} — recreated from the fleet spec and verified. See ${LOG_FILE}."
   else
     warn "ROGUE: $name — status ${status}, exit ${exit1}, unhealthy ${WINDOW_SECS}s+ (total restarts ${rc1}); circuit-breaking"
     # Drop the always-restart policy first so Docker can't immediately resurrect it,

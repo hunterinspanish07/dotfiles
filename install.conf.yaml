@@ -51,6 +51,19 @@
     # so no shell-config change is needed. Relocate if you keep tools elsewhere.
     ~/go/bin/litmux:
       path: bin/litmux
+    # periodic — the scheduling primitive both launchd agents below run under. launchd's
+    # StartInterval does not fire on this machine (measured: runner-guard sat at runs=1 for
+    # six weeks, ci-janitor for seventeen days), so each agent is instead a long-lived
+    # process launchd only has to start once and keep alive. Linked first: the other two
+    # agents' installers refuse to run without it.
+    ~/.config/periodic:
+      path: config/periodic
+    # runner-fleet — the single spec for this host's self-hosted runners, and the script
+    # that creates them from it. Before this, a runner existed only as a docker run
+    # snippet pasted into three per-repo docs that had all drifted from the live
+    # containers. runner-guard reads this spec to recreate a runner it circuit-breaks.
+    ~/.config/runner-fleet:
+      path: config/runner-fleet
     # runner-guard — machine-wide circuit breaker for crash-looping self-hosted CI
     # runners. Links the whole dir so the launchd plist references a stable runtime
     # path (~/.config/runner-guard/runner-guard.sh). Loading the agent is a one-time
