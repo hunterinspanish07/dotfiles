@@ -151,6 +151,12 @@ TIMEOUT="${TIMEOUT:-$INTERVAL}"
 command -v "$1" >/dev/null 2>&1 || [[ -x "$1" ]] \
   || { echo "periodic.sh: supervised command '$1' not found or not executable" >&2; exit 2; }
 
+# [LAW:no-silent-failure] exception: under `set -e` a bare mkdir failure would abort the
+# supervisor at startup, which trades a reporting outage for a GUARDING outage — the agent
+# would stop restarting runners because it could not create a log directory. The primary
+# job is worth more than the heartbeat, so the failure is carried, not fatal. It is not
+# swallowed: the per-cycle heartbeat write below reports it loudly every interval, and
+# `--status` reads the missing heartbeat as STALE. One enforcer, sited at the write.
 mkdir -p "$(dirname "$HEARTBEAT")" || true
 log() { printf '%s periodic[%s]: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$LABEL" "$*"; }
 
@@ -189,12 +195,16 @@ while true; do
   # no timeout(1), so this is it: a killer that races the command and leaves a marker so
   # a timeout is distinguishable from a command that merely exited 143 on its own.
   # [LAW:no-ambient-temporal-coupling]
-  # stderr silenced on the killer alone. Reaping its `sleep` makes bash announce
-  # "Terminated: 15  sleep" — once per cycle, which at runner-guard's 120s interval is 720
-  # lines of pure noise a day in launchd.err. An error log nobody reads because it is full
-  # of benign chatter is a log that cannot report the next real failure; the alarm has to
-  # stay quiet to stay meaningful. The subshell has no diagnostics of its own to lose — it
-  # only sleeps, tests, and kills.
+  # [LAW:no-silent-failure] exception: stderr silenced on the killer subshell alone.
+  # Reaping its `sleep` makes bash announce "Terminated: 15  sleep" — once per cycle, which
+  # at runner-guard's 120s interval is 720 lines of pure noise a day in launchd.err. An
+  # error log nobody reads because it is full of benign chatter is a log that cannot report
+  # the next real failure; the alarm has to stay quiet to stay meaningful.
+  # The scope is deliberately one subshell, and its only real diagnostic is `: > "$marker"`
+  # failing. That is not a lost signal: the marker sits beside the heartbeat, so the only
+  # way it fails is an unwritable directory — which the heartbeat write below already
+  # reports loudly EVERY cycle, naming the directory. Same fault, one louder report,
+  # already sited where the write happens. Do not widen this redirection past the subshell.
   ( sleep "$TIMEOUT"; if kill -0 "$running_pid" 2>/dev/null; then : > "$marker"; kill -TERM "$running_pid" 2>/dev/null; sleep 5; kill -KILL "$running_pid" 2>/dev/null; fi ) 2>/dev/null & killer=$!
   killer_pid="$killer"
 
