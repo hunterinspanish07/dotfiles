@@ -146,7 +146,7 @@ while [[ "$waited" -lt "$VERIFY_TIMEOUT" ]]; do
     echo "  plist:     $DEST -> $PLIST"
     echo "  runs:      $CMD (every ${INTERVAL}s)"
     echo "  heartbeat: $HEARTBEAT"
-    echo "  liveness:  $SUPERVISOR --status --interval $INTERVAL --heartbeat $HEARTBEAT"
+    echo "  liveness:  $SUPERVISOR --status --heartbeat $HEARTBEAT"
     exit 0
   fi
 done

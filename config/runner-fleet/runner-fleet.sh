@@ -363,9 +363,21 @@ cmd_up() {
   log "image resolved: $image"
   for i in "${SELECTED[@]}"; do
     st="${STATES[$n]}"; n=$((n+1))
-    if [[ "$st" == "healthy" && "$force" -eq 0 ]]; then
-      log "ok: ${R_NAME[$i]} is healthy; leaving it alone"
-      continue
+    # `settling` is the classifier saying "unhealthy at one end of the window only — not
+    # yet a verdict". Recreating on it would throw away the entire reason the measurement
+    # takes two samples, and it is destructive: stop, remove, re-register. A runner that
+    # crashes once between the samples (a flaky job, an OOM) would be torn down on an
+    # unconfirmed signal by a bare `runner-fleet.sh up`. runner-guard never relies on this
+    # path — it confirms persistence across its own window first and then passes --force —
+    # so declining here costs nothing and protects the manual invocation.
+    # [LAW:types-are-the-program] the state's documented meaning is enforced, not just described.
+    if [[ "$force" -eq 0 ]]; then
+      case "$st" in
+        healthy)
+          log "ok: ${R_NAME[$i]} is healthy; leaving it alone"; continue ;;
+        settling)
+          log "skip: ${R_NAME[$i]} is settling (unhealthy at one sample only, no verdict yet); re-run to re-measure, or --force to replace it anyway"; continue ;;
+      esac
     fi
     log "converging ${R_NAME[$i]}: state=$st force=$force"
     acted=1

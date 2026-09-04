@@ -42,7 +42,7 @@ usage() {
   cat >&2 <<'USAGE'
 usage:
   periodic.sh --label L --interval SECS --heartbeat PATH [--timeout SECS] -- COMMAND [ARG...]
-  periodic.sh --status --heartbeat PATH --interval SECS
+  periodic.sh --status --heartbeat PATH
 
   --label      name used in log lines (e.g. runner-guard)
   --interval   seconds to sleep between cycles
@@ -50,7 +50,10 @@ usage:
   --timeout    kill one cycle after this many seconds (default: --interval).
                A hung cycle is the one failure KeepAlive cannot see — the process is
                still alive, so launchd is satisfied while nothing is actually running.
-  --status     report whether the heartbeat is fresh; exit 0 fresh, 1 stale
+  --status     report whether the heartbeat is fresh; exit 0 fresh, 1 stale.
+               Needs only --heartbeat: the running supervisor stamps its own interval
+               and timeout into the file, so the checker reads them rather than being
+               told them a second time.
 USAGE
 }
 
@@ -71,36 +74,58 @@ done
 # cycle 500 is a supervisor that looked healthy for a day. Loud, at the boundary, once.
 # [LAW:no-silent-failure]
 [[ -n "$HEARTBEAT" ]] || { echo "periodic.sh: --heartbeat is required" >&2; usage; exit 2; }
-[[ "$INTERVAL" =~ ^[0-9]+$ && "$INTERVAL" -gt 0 ]] \
-  || { echo "periodic.sh: --interval must be a positive integer (got '${INTERVAL}')" >&2; exit 2; }
 
 # --- status mode --------------------------------------------------------------
-# Freshness bar: a heartbeat older than two intervals plus a minute of slack. One
-# interval would false-alarm on any cycle that merely ran long; two plus slack fires
-# only when a cycle was genuinely skipped — which, on this machine, means the agent is
-# gone. This is the check that would have caught the six-week outage on day one.
+# Freshness bar: one interval (the wait between cycles) PLUS one timeout (the longest a
+# cycle may legitimately take) plus a minute of slack.
+#
+# It used to be `interval * 2 + 60`, which silently assumed timeout ~= interval. The
+# shipped runner-guard config deliberately breaks that assumption — interval 120, timeout
+# 900 — precisely because one cycle may heal three runners, each with a pull and a
+# verification hold. So the old bar was 300s while a correct cycle could run to 900s, and
+# `--status` would have declared the agent dead in the middle of doing the exact job this
+# whole thing exists to do unattended. A liveness check that cries wolf during the
+# incident is worse than none. [FRAMING:representation]
+#
+# Both numbers are read from the heartbeat, which the RUNNING supervisor stamps with the
+# parameters it is actually running under. Passing them in again would be a second copy of
+# the agent's configuration, free to drift from the plist the way the old formula did.
+# [LAW:one-source-of-truth]
 if [[ "$STATUS" -eq 1 ]]; then
-  max_age=$(( INTERVAL * 2 + 60 ))
   if [[ ! -f "$HEARTBEAT" ]]; then
     echo "STALE: no heartbeat at $HEARTBEAT — the agent has never completed a cycle" >&2
     exit 1
   fi
+  line=$(cat "$HEARTBEAT" 2>/dev/null) || { echo "STALE: cannot read $HEARTBEAT" >&2; exit 1; }
+  hb_interval=$(printf '%s\n' "$line" | sed -n 's/.*[[:space:]]interval=\([0-9][0-9]*\).*/\1/p')
+  hb_timeout=$(printf  '%s\n' "$line" | sed -n 's/.*[[:space:]]timeout=\([0-9][0-9]*\).*/\1/p')
+  # No fallback to a guessed bar. A heartbeat without these fields was written by an older
+  # periodic.sh, and quietly substituting a different threshold is how a checker starts
+  # answering a question it wasn't asked. [LAW:no-silent-failure]
+  if [[ -z "$hb_interval" || -z "$hb_timeout" ]]; then
+    echo "periodic.sh: $HEARTBEAT has no interval=/timeout= fields — written by an older" >&2
+    echo "             periodic.sh. Reinstall the agent so it stamps them: $line" >&2
+    exit 2
+  fi
+  max_age=$(( hb_interval + hb_timeout + 60 ))
   now=$(date +%s)
   # stat -f %m is the BSD/macOS spelling; this script is macOS-only by construction
   # (it exists to work around a macOS launchd defect).
   mtime=$(stat -f %m "$HEARTBEAT") || { echo "STALE: cannot stat $HEARTBEAT" >&2; exit 1; }
   age=$(( now - mtime ))
   if [[ "$age" -gt "$max_age" ]]; then
-    echo "STALE: heartbeat is ${age}s old (max ${max_age}s) — agent is not running: $(cat "$HEARTBEAT" 2>/dev/null)" >&2
+    echo "STALE: heartbeat is ${age}s old (max ${max_age}s = interval ${hb_interval} + timeout ${hb_timeout} + 60) — agent is not running: $line" >&2
     exit 1
   fi
-  echo "fresh: heartbeat ${age}s old (max ${max_age}s) — $(cat "$HEARTBEAT" 2>/dev/null)"
+  echo "fresh: heartbeat ${age}s old (max ${max_age}s) — $line"
   exit 0
 fi
 
 # --- loop mode ----------------------------------------------------------------
 [[ -n "$LABEL" ]] || { echo "periodic.sh: --label is required" >&2; usage; exit 2; }
 [[ $# -gt 0 ]]    || { echo "periodic.sh: no command given after --" >&2; usage; exit 2; }
+[[ "$INTERVAL" =~ ^[0-9]+$ && "$INTERVAL" -gt 0 ]] \
+  || { echo "periodic.sh: --interval must be a positive integer (got '${INTERVAL}')" >&2; exit 2; }
 TIMEOUT="${TIMEOUT:-$INTERVAL}"
 [[ "$TIMEOUT" =~ ^[0-9]+$ && "$TIMEOUT" -gt 0 ]] \
   || { echo "periodic.sh: --timeout must be a positive integer (got '${TIMEOUT}')" >&2; exit 2; }
@@ -108,8 +133,19 @@ TIMEOUT="${TIMEOUT:-$INTERVAL}"
 # The supervised command must exist NOW. Discovering it at cycle time would produce a
 # process launchd happily keeps alive while it accomplishes nothing — the exact shape of
 # the failure this file exists to end. [LAW:no-silent-failure]
+#
+# Both plists supervise via `-- /bin/bash <script>`, so checking only "$1" checked
+# /bin/bash — a test that cannot fail, standing in for the one that matters. A deleted
+# runner-guard.sh would have sailed past it and then failed every cycle forever, visible
+# only as exit=127 buried in heartbeat data rather than as the documented refusal to
+# start. Check the interpreter AND the script it is handed.
 command -v "$1" >/dev/null 2>&1 || [[ -x "$1" ]] \
   || { echo "periodic.sh: supervised command '$1' not found or not executable" >&2; exit 2; }
+SUPERVISED_SCRIPT="${@:$#}"
+if [[ "$SUPERVISED_SCRIPT" != "$1" ]]; then
+  [[ -r "$SUPERVISED_SCRIPT" ]] \
+    || { echo "periodic.sh: supervised script '$SUPERVISED_SCRIPT' not found or not readable" >&2; exit 2; }
+fi
 
 mkdir -p "$(dirname "$HEARTBEAT")" || true
 log() { printf '%s periodic[%s]: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$LABEL" "$*"; }
@@ -175,7 +211,7 @@ while true; do
   # which is a different fact from "the job succeeded". The job's outcome rides along as
   # DATA in the line, so a persistently-failing job never reads as a dead agent and a
   # dead agent never hides behind a succeeding one. [LAW:one-source-of-truth]
-  printf '%s %s %s exit=%s\n' "$(date +%s)" "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$LABEL" "$rc" > "${HEARTBEAT}.tmp" \
+  printf '%s %s %s exit=%s interval=%s timeout=%s\n' "$(date +%s)" "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$LABEL" "$rc" "$INTERVAL" "$TIMEOUT" > "${HEARTBEAT}.tmp" \
     && mv -f "${HEARTBEAT}.tmp" "$HEARTBEAT" \
     || log "WARNING: could not write heartbeat $HEARTBEAT"
 

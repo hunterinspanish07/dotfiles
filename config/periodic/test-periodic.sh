@@ -26,16 +26,41 @@ check "zero interval exits 2" "$?" "2"
 check "non-numeric interval exits 2" "$?" "2"
 "$PERIODIC" --label x --interval 1 -- /bin/true >/dev/null 2>&1
 check "missing heartbeat exits 2" "$?" "2"
+# Both plists supervise via `-- /bin/bash <script>`, so a check that only looked at "$1"
+# only ever confirmed /bin/bash exists — it could not fail for the real usage shape, while
+# the script that actually matters went unchecked.
+"$PERIODIC" --label x --interval 1 --heartbeat "$TMP/hb" -- /bin/bash "$TMP/no-such-script.sh" >/dev/null 2>&1
+check "missing supervised SCRIPT (not just interpreter) exits 2" "$?" "2"
 
 echo "== status contract =="
-"$PERIODIC" --status --interval 10 --heartbeat "$TMP/absent" >/dev/null 2>&1
+"$PERIODIC" --status --heartbeat "$TMP/absent" >/dev/null 2>&1
 check "absent heartbeat is stale (1)" "$?" "1"
-printf '%s iso label exit=0\n' "$(( $(date +%s) - 5 ))" > "$TMP/fresh"; touch "$TMP/fresh"
-"$PERIODIC" --status --interval 10 --heartbeat "$TMP/fresh" >/dev/null 2>&1
+printf '%s iso lbl exit=0 interval=10 timeout=10\n' "$(date +%s)" > "$TMP/fresh"
+"$PERIODIC" --status --heartbeat "$TMP/fresh" >/dev/null 2>&1
 check "just-written heartbeat is fresh (0)" "$?" "0"
+printf '%s iso lbl exit=0 interval=10 timeout=10\n' "$(date +%s)" > "$TMP/old"
 touch -t 202001010000 "$TMP/old"
-"$PERIODIC" --status --interval 10 --heartbeat "$TMP/old" >/dev/null 2>&1
+"$PERIODIC" --status --heartbeat "$TMP/old" >/dev/null 2>&1
 check "ancient heartbeat is stale (1)" "$?" "1"
+# A heartbeat from an older periodic.sh has no interval=/timeout=. Substituting a guessed
+# threshold would answer a different question than the one asked, silently.
+printf '%s iso lbl exit=0\n' "$(date +%s)" > "$TMP/legacy"
+"$PERIODIC" --status --heartbeat "$TMP/legacy" >/dev/null 2>&1
+check "heartbeat without interval=/timeout= fails loud (2), never a guessed bar" "$?" "2"
+
+echo "== a long but legitimate cycle is not 'dead' (the false-STALE regression) =="
+# runner-guard ships interval 120 / timeout 900: one cycle may heal three runners, each
+# with a pull and a verification hold. The old bar was interval*2+60 = 300s, so an agent
+# 400s into correct work read as STALE -- crying wolf during the exact incident it exists
+# to handle. The bar must be interval + timeout + slack.
+printf '%s iso runner-guard exit=0 interval=120 timeout=900\n' "$(date +%s)" > "$TMP/slow"
+touch -t "$(date -v-400S '+%Y%m%d%H%M.%S')" "$TMP/slow"
+"$PERIODIC" --status --heartbeat "$TMP/slow" >/dev/null 2>&1
+check "400s old with interval=120 timeout=900 is FRESH (was falsely stale)" "$?" "0"
+printf '%s iso runner-guard exit=0 interval=120 timeout=900\n' "$(date +%s)" > "$TMP/reallydead"
+touch -t "$(date -v-1200S '+%Y%m%d%H%M.%S')" "$TMP/reallydead"
+"$PERIODIC" --status --heartbeat "$TMP/reallydead" >/dev/null 2>&1
+check "1200s old with the same config is genuinely STALE" "$?" "1"
 
 echo "== the loop keeps cycling (the six-week bug) =="
 HB="$TMP/loop.hb"; COUNT="$TMP/count"
@@ -69,7 +94,7 @@ kill "$P2" 2>/dev/null; wait "$P2" 2>/dev/null
 n2=$(wc -l < "$C2" | tr -d ' ')
 if [[ "$n2" -ge 2 ]]; then ok "loop survived a job exiting non-zero ($n2 cycles)"; else no "loop died on a failing job ($n2 cycles)"; fi
 grep -q 'exit=3' "$HB2" && ok "heartbeat records the job's non-zero exit as data" || no "heartbeat lost the exit code: $(cat "$HB2" 2>/dev/null)"
-"$PERIODIC" --status --interval 1 --heartbeat "$HB2" >/dev/null 2>&1
+"$PERIODIC" --status --heartbeat "$HB2" >/dev/null 2>&1
 check "a failing job still reports the agent as ALIVE" "$?" "0"
 
 echo "== a hung cycle cannot stall the loop (KeepAlive's blind spot) =="

@@ -64,6 +64,13 @@
     # containers. runner-guard reads this spec to recreate a runner it circuit-breaks.
     ~/.config/runner-fleet:
       path: config/runner-fleet
+    # ...and on PATH under its own name, because every runner doc now instructs
+    # `runner-fleet.sh up <name>`. Without this the documented command does not resolve —
+    # an instruction that cannot be followed is the same broken map as a stale one, just
+    # louder. A symlink to the same file, not a copy, so there is nothing to drift.
+    # ~/.local/bin is already on PATH, same idea as ~/go/bin/litmux above.
+    ~/.local/bin/runner-fleet.sh:
+      path: config/runner-fleet/runner-fleet.sh
     # runner-guard — machine-wide circuit breaker for crash-looping self-hosted CI
     # runners. Links the whole dir so the launchd plist references a stable runtime
     # path (~/.config/runner-guard/runner-guard.sh). Loading the agent is a one-time

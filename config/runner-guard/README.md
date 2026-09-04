@@ -92,8 +92,7 @@ advanced.
 
 ```bash
 # Is the guard actually alive?  exit 0 = yes, exit 1 = it is not running
-~/.config/periodic/periodic.sh --status --interval 120 \
-  --heartbeat ~/.local/share/runner-guard/heartbeat
+~/.config/periodic/periodic.sh --status --heartbeat ~/.local/share/runner-guard/heartbeat
 ```
 
 ## Knobs (env vars, all optional)

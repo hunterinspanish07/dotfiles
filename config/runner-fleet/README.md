@@ -24,9 +24,11 @@ runner-fleet.sh plan [NAME...]          # print the docker run it would issue (n
 runner-fleet.sh adopt [NAME...]         # recover a live container's PAT into its pat-file
 ```
 
-`up` replaces a runner that is absent, looping or parked, and leaves a healthy one alone.
-`--force` replaces regardless — which is also how you take a new runner version, since
-auto-update is off by design (below).
+`up` replaces a runner that is **absent**, **looping** or **parked**. It leaves **healthy**
+alone, and also leaves **settling** alone — that state means "unhealthy at one end of the
+sampling window only, no verdict yet", and tearing a runner down on an unconfirmed signal
+would discard the whole point of measuring twice. `--force` replaces regardless, which is
+also how you take a new runner version, since auto-update is off by design (below).
 
 Exit codes: `0` in the desired state · `1` at least one runner could not be brought up
 (verified, not assumed) · `2` the script could not run (Docker unreachable, spec invalid,

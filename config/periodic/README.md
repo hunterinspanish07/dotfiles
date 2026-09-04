@@ -41,8 +41,7 @@ agent and a dead agent never hides behind a succeeding one.
 
 ```bash
 # Is an agent actually alive?  exit 0 = fresh, exit 1 = stale (it is not running)
-~/.config/periodic/periodic.sh --status --interval 120 \
-  --heartbeat ~/.local/share/runner-guard/heartbeat
+~/.config/periodic/periodic.sh --status --heartbeat ~/.local/share/runner-guard/heartbeat
 ```
 
 `install-agent.sh` uses the same signal, which is the point: it captures the heartbeat, boots
@@ -61,7 +60,7 @@ nothing happens and the heartbeat quietly stops. So each cycle has an explicit d
 
 ```
 periodic.sh --label L --interval SECS --heartbeat PATH [--timeout SECS] -- COMMAND [ARG...]
-periodic.sh --status --heartbeat PATH --interval SECS
+periodic.sh --status --heartbeat PATH
 
 install-agent.sh <plist> [required-binary...]     # load an agent and prove it runs
 ```
