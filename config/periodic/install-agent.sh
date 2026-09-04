@@ -60,10 +60,17 @@ for (( i=0; i<${#ARGS[@]}; i++ )); do
   case "${ARGS[$i]}" in
     --interval)  INTERVAL="${ARGS[$((i+1))]:-}" ;;
     --heartbeat) HEARTBEAT="${ARGS[$((i+1))]:-}" ;;
-    --)          seen_ddash=1; CMD="${ARGS[$((i+1))]:-}" ;;
+    --)          seen_ddash=1 ;;
   esac
 done
 SUPERVISOR="${ARGS[1]:-}"
+# The supervised command is written `-- /bin/bash <script>`, so the element straight after
+# `--` is the INTERPRETER, not the thing being supervised. Taking that one meant the
+# existence check below dutifully confirmed /bin/bash was present — which it always is —
+# and reported "runs: /bin/bash", while never checking the script that actually matters.
+# A check that cannot fail is not a check. The script is the last argument.
+# [LAW:verifiable-goals]
+CMD="${ARGS[$(( ${#ARGS[@]} - 1 ))]:-}"
 
 [[ -n "$HEARTBEAT" ]] || { echo "ERROR: $PLIST does not pass --heartbeat to periodic.sh; this installer only handles supervised agents" >&2; exit 1; }
 [[ -n "$INTERVAL"  ]] || { echo "ERROR: $PLIST does not pass --interval to periodic.sh" >&2; exit 1; }
@@ -107,7 +114,19 @@ before=0
 [[ -f "$HEARTBEAT" ]] && before=$(stat -f %m "$HEARTBEAT" 2>/dev/null || echo 0)
 
 DOMAIN="gui/$(id -u)"
-launchctl bootout   "$DOMAIN/$LABEL" 2>/dev/null || true   # ignore "not loaded"
+# `launchctl bootout` returns before the job is actually gone, and these agents are now
+# long-running processes rather than something that exits in milliseconds — so bootstrap
+# raced the teardown and failed with the famously unhelpful "Bootstrap failed: 5:
+# Input/output error", which reads like a broken plist and is really just "that label is
+# still loaded". Wait for the unload to be OBSERVED instead of assumed: the ordering here
+# is a real precondition, so it gets an explicit check rather than a hopeful sleep.
+# [LAW:no-ambient-temporal-coupling]
+launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true   # ignore "not loaded"
+unload_waited=0
+while launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; do
+  [[ "$unload_waited" -ge 30 ]] && { echo "ERROR: $LABEL is still loaded 30s after bootout; not replacing it blind" >&2; exit 1; }
+  sleep 2; unload_waited=$((unload_waited+2))
+done
 launchctl bootstrap "$DOMAIN" "$DEST" || { echo "ERROR: launchctl bootstrap failed for $LABEL" >&2; exit 1; }
 launchctl enable    "$DOMAIN/$LABEL"
 # An explicit kickstart is a DEMAND spawn. On this machine that is the reliable one —

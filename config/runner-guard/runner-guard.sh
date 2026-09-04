@@ -252,7 +252,7 @@ for i in "${!runners[@]}"; do
       heal_failed=1; continue
     elif [[ "$status" != "exited" && "$status" != "dead" ]]; then
       rogue_found=1
-      warn "STOPPED: $name — completed an owed circuit-break. Root-cause it (broken image / dead PAT / OOM), then recreate per that project's runner docs (docs/CI-RUNNERS.md)."
+      warn "STOPPED: $name — completed an owed circuit-break. A recreate was already tried or was unavailable, so the cause is upstream of the container (expired PAT / revoked repo access / wedged VM / bad image). Root-cause it, then: runner-fleet.sh up --force $name"
       notify "Stopped rogue runner ${name} (owed stop completed). See ${LOG_FILE}."
     else
       log "parked: $name — not running, restart policy=no, already stopped; not a live crash-loop"
@@ -294,7 +294,7 @@ for i in "${!runners[@]}"; do
       heal_failed=1; continue
     fi
     rogue_found=1   # set only AFTER the stop actually lands — exit 1 means "stopped"
-    warn "STOPPED: $name is halted. Root-cause it (broken image / dead PAT / OOM), then recreate per that project's runner docs (docs/CI-RUNNERS.md)."
+    warn "STOPPED: $name is halted. A recreate was already tried or was unavailable, so the cause is upstream of the container (expired PAT / revoked repo access / wedged VM / bad image). Root-cause it, then: runner-fleet.sh up --force $name"
     notify "Stopped rogue runner ${name} (exit ${exit1}, crash-looping). See ${LOG_FILE}."
   fi
 done
