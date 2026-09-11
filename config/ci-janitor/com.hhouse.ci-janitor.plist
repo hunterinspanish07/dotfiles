@@ -5,12 +5,24 @@
      Install/stop: run ./install.sh in this directory (idempotent), or by hand:
        launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hhouse.ci-janitor.plist
        launchctl bootout   gui/$(id -u)/com.hhouse.ci-janitor
-     Paths are absolute by this repo's convention (single-user machine); the script is
-     the dotbot-linked ~/.config/ci-janitor/ci-janitor.sh.
+     Paths are absolute by this repo's convention (single-user machine); the scripts are
+     the dotbot-linked ~/.config/{periodic,ci-janitor}/.
 
      Daily, plus RunAtLoad so a machine that was off during a scheduled window still
      sweeps once it comes back. The script's own age floor (24h) is what keeps a sweep
-     from touching a live job, so the schedule never has to be timed around CI. -->
+     from touching a live job, so the schedule never has to be timed around CI.
+
+     WHY KeepAlive AND NOT StartInterval
+     This agent used to say `StartInterval 86400`. Between its install on 2026-08-18 and
+     2026-09-04 it should have swept seventeen times; `launchctl print` showed `runs = 1`
+     and its log ended on install day. launchd in this gui/501 domain does not execute the
+     pended nondemand spawns an interval needs — measured directly, see the note in
+     com.hhouse.runner-guard.plist and the rationale in periodic.sh. That is not a
+     cosmetic outage for THIS agent: the leak it exists to sweep is what put 25GB of
+     orphaned volumes and images on this host and drove it to ENOSPC.
+
+     So the schedule now lives in periodic.sh, which launchd only has to start once and
+     keep alive, and every sweep stamps a heartbeat that makes a dead janitor visible. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -18,6 +30,20 @@
   <string>com.hhouse.ci-janitor</string>
   <key>ProgramArguments</key>
   <array>
+    <string>/bin/bash</string>
+    <string>/Users/hhouse/.config/periodic/periodic.sh</string>
+    <string>--label</string>
+    <string>ci-janitor</string>
+    <string>--interval</string>
+    <string>86400</string>
+    <!-- A sweep enumerates and removes; an hour is far beyond any real sweep and still
+         bounds one wedged on an unresponsive Docker socket, rather than letting it hold
+         the daily slot open forever. -->
+    <string>--timeout</string>
+    <string>3600</string>
+    <string>--heartbeat</string>
+    <string>/Users/hhouse/.local/share/ci-janitor/heartbeat</string>
+    <string>--</string>
     <string>/bin/bash</string>
     <string>/Users/hhouse/.config/ci-janitor/ci-janitor.sh</string>
   </array>
@@ -33,8 +59,8 @@
   </dict>
   <key>RunAtLoad</key>
   <true/>
-  <key>StartInterval</key>
-  <integer>86400</integer>
+  <key>KeepAlive</key>
+  <true/>
   <key>StandardOutPath</key>
   <string>/Users/hhouse/.local/share/ci-janitor/launchd.out</string>
   <key>StandardErrorPath</key>
