@@ -26,7 +26,7 @@
     ],
     "defaultMode": "auto"
   },
-  "model": "opus",
+  "model": "sonnet[1m]",
   "hooks": {
     "Stop": [
       {
@@ -118,7 +118,7 @@
       "autoUpdate": true
     }
   },
-  "effortLevel": "medium",
+  "effortLevel": "high",
   "voice": {
     "enabled": true,
     "mode": "hold"
