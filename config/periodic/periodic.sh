@@ -233,6 +233,15 @@ while true; do
   # no timeout(1), so this is it: a killer that races the command and leaves a marker so
   # a timeout is distinguishable from a command that merely exited 143 on its own.
   # [LAW:no-ambient-temporal-coupling]
+  #
+  # Deliberately a RELATIVE sleep, unlike the interval wait above, and not an oversight: the
+  # two are different quantities. The interval is a promise about the calendar ("swept
+  # daily"), so it is measured against the wall clock. This is a budget of MACHINE time —
+  # "this job has had TIMEOUT seconds of machine and produced nothing" — and the failure it
+  # catches, a cycle wedged on an unresponsive socket, burns awake seconds while a suspended
+  # job burns none. On the wall clock it would kill healthy jobs that merely had a lid closed
+  # on them and stamp exit=timeout for a timeout that never happened, corrupting the one
+  # alarm that reports real wedging. [LAW:types-are-the-program]
   # [LAW:no-silent-failure] exception: stderr silenced on the killer subshell alone.
   # Reaping its `sleep` makes bash announce "Terminated: 15  sleep" — once per cycle, which
   # at runner-guard's 120s interval is 720 lines of pure noise a day in launchd.err. An
