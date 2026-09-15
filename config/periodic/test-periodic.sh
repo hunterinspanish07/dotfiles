@@ -16,6 +16,17 @@ pass=0; fail=0
 ok()   { printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
 no()   { printf '  FAIL %s\n' "$1"; fail=$((fail+1)); }
 check() { if [[ "$2" == "$3" ]]; then ok "$1"; else no "$1 (expected '$3', got '$2')"; fi; }
+# Poll a file until it holds WANT lines, giving up after BUDGET seconds. Polled, not slept
+# through: a fixed sleep would have to be the worst case on every run, passing or failing.
+await_lines() {
+  local file="$1" want="$2" budget="$3" stop
+  stop=$(( $(date +%s) + budget ))
+  while (( $(date +%s) < stop )); do
+    [[ -f "$file" ]] && (( $(wc -l < "$file") >= want )) && return 0
+    sleep 1
+  done
+  return 1
+}
 
 echo "== invocation contract =="
 "$PERIODIC" --label x --interval 1 --heartbeat "$TMP/hb" -- /nonexistent-command-xyz >/dev/null 2>&1
@@ -145,6 +156,57 @@ if [[ "$survivors" -eq 0 ]]; then ok "nothing from this run survived the supervi
 # stray `sleep 900` under a running runner-guard.
 orphans=$(pgrep -x sleep 2>/dev/null | while read -r pid; do ps -o command= -p "$pid" 2>/dev/null | grep -qx "sleep $KILLER_TIMEOUT" && echo "$pid"; done | wc -l | tr -d ' ')
 if [[ "$orphans" -eq 0 ]]; then ok "the killer's own sleep was reaped (no orphan per cycle)"; else no "$orphans orphaned 'sleep $KILLER_TIMEOUT' left behind"; pkill -x -f "sleep $KILLER_TIMEOUT" 2>/dev/null; fi
+
+echo "== a tick that came due while the machine slept runs on wake (the drift bug) =="
+# `sleep` counts AWAKE seconds, so on a host that suspends a "daily" sweep lands later every
+# day until ticks are skipped — caught live at 87,484 wall-clock seconds against an 86,400s
+# timer, and at its worst a 136-hour gap between two daily sweeps.
+#
+# A test cannot suspend the machine and needn't: the defect IS a disagreement between the
+# wall clock and a relative timer, so the test moves the clock. A stub `date` on the
+# supervisor's PATH jumps past the due time mid-wait. A supervisor scheduling against the
+# wall clock notices at its next recheck; one trusting a relative timer waits out the hour.
+#
+# Asserts the observable contract — did the overdue cycle run — never the shape of the wait,
+# so any implementation that honours the wall clock passes unchanged. [LAW:behavior-not-structure]
+#
+# LAST section deliberately: it leaves a supervisor running until its final line, and the
+# hung-cycle section above asserts nothing under "$TMP" survives.
+CLOCKBIN="$TMP/clockbin"; mkdir -p "$CLOCKBIN"
+OFFSET="$TMP/clock-offset"
+printf '0\n' > "$OFFSET"
+cat > "$CLOCKBIN/date" <<STUB
+#!/bin/bash
+set -euo pipefail
+# No fallback when the offset is unreadable: a stub quietly reporting the real time would
+# turn this test green for a reason unrelated to the fix. [LAW:no-silent-failure]
+offset=\$(cat "$OFFSET")
+[[ "\${1:-}" == "+%s" ]] || exec /bin/date "\$@"
+echo \$(( \$(/bin/date +%s) + offset ))
+STUB
+chmod +x "$CLOCKBIN/date"
+
+WAKE_HB="$TMP/wake.hb"; WAKE_COUNT="$TMP/wake.count"; : > "$WAKE_COUNT"
+cat > "$TMP/waketick.sh" <<'WAKETICK'
+#!/bin/bash
+echo tick >> "$1"
+WAKETICK
+chmod +x "$TMP/waketick.sh"
+# An hour-long interval separates "ran promptly" from "waited out another interval" by an
+# hour, leaving no room for timing luck to decide which happened.
+PATH="$CLOCKBIN:$PATH" "$PERIODIC" --label wake --interval 3600 --timeout 30 \
+  --heartbeat "$WAKE_HB" -- "$TMP/waketick.sh" "$WAKE_COUNT" >/dev/null 2>&1 &
+PW=$!
+if await_lines "$WAKE_COUNT" 1 20; then ok "the startup cycle ran"; else no "the startup cycle never ran"; fi
+# Overdue by twice the interval. Atomic: the supervisor reads this on every clock call, and
+# a half-written offset is a clock that jumps somewhere nobody asked for.
+printf '7200\n' > "$OFFSET.tmp" && mv -f "$OFFSET.tmp" "$OFFSET"
+if await_lines "$WAKE_COUNT" 2 40; then
+  ok "a tick overdue by 2x the interval ran once the wall clock said it was due"
+else
+  no "the overdue tick never ran — the wait is measured by a relative timer, not the wall clock (THE BUG)"
+fi
+kill "$PW" 2>/dev/null; wait "$PW" 2>/dev/null
 
 echo
 echo "passed: $pass   failed: $fail"

@@ -56,6 +56,21 @@ nothing happens and the heartbeat quietly stops. So each cycle has an explicit d
 (`--timeout`, default = the interval); an overrun is killed, reaped, and recorded as
 `exit=timeout`.
 
+## A machine that sleeps
+
+`sleep N` waits N *awake* seconds, not N seconds of wall clock. Every suspend stretched the
+gap between cycles by the length of the suspend, and because each wait began only when the
+last one ended, the lateness accumulated until ticks were skipped outright — measured live at
+87,484 wall-clock seconds against ci-janitor's 86,400s timer, and at its worst a 136-hour gap
+between two "daily" sweeps. The daily disk-leak sweep had quietly become a weekly one, and
+nothing chose that.
+
+So a cycle now waits on an absolute wall-clock deadline, slept toward in slices of 15s. A
+suspend can stretch at most one slice; after it the remaining time is already zero and the
+cycle runs. Wake-up lateness is capped at one slice however long the machine slept — and the
+supervisor stays as interruptible as it was, so `launchctl bootout` still lands in under a
+second rather than at the end of the interval.
+
 ## Use
 
 ```

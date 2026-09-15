@@ -47,7 +47,8 @@ usage:
   periodic.sh --status --heartbeat PATH
 
   --label      name used in log lines (e.g. runner-guard)
-  --interval   seconds to sleep between cycles
+  --interval   wall-clock seconds between cycles. Measured against the clock, not counted
+               by sleeping: on a machine that suspends those are not the same span.
   --heartbeat  file stamped after every cycle; its mtime is the liveness signal
   --timeout    kill one cycle after this many seconds (default: --interval).
                A hung cycle is the one failure KeepAlive cannot see — the process is
@@ -184,6 +185,43 @@ terminate() {
 }
 trap terminate TERM INT
 
+# The longest the supervisor may go without re-reading the wall clock.
+#
+# `sleep N` waits N AWAKE seconds, not N wall-clock seconds, so every suspend stretches the
+# gap between cycles and the lateness accumulates until ticks are skipped. Measured live on
+# this host 2026-09-14 21:02 CDT: ci-janitor 87,484 wall-clock seconds past its last sweep
+# against an 86,400s timer, still sleeping. At its extreme, a 136-hour gap between two
+# "daily" sweeps — a disk-leak guard quietly demoted to once a week.
+#
+# So the wait runs against an absolute deadline, slept toward in slices this long. A suspend
+# stretches at most ONE slice; after it the remainder is already zero and the cycle runs, so
+# wake-up lateness is capped here regardless of how long the machine slept.
+# [LAW:no-ambient-temporal-coupling]
+#
+# 15s sits far below the shortest interval shipped (runner-guard's 120s), so a wake never
+# perturbs a cadence, and four forked sleeps a minute costs nothing worth weighing.
+CLOCK_RECHECK_S=15
+
+# Wait until the wall clock reaches DEADLINE (epoch seconds).
+#
+# Time left is a VALUE recomputed each slice, never a duration baked in once and trusted. An
+# already-passed deadline is just a remainder of zero, so there is no "if we are overdue"
+# branch: overdue is not a different case, only a different number.
+# [LAW:dataflow-not-control-flow]
+#
+# Each slice sleeps in the background and is waited on, as the single long sleep it replaces
+# did — that is what makes a launchd TERM land promptly. `running_pid` stays the one variable
+# `terminate` kills, so slicing leaves the shutdown path alone. [LAW:single-enforcer]
+wait_until() {
+  local deadline="$1" slice
+  while (( (slice = deadline - $(date +%s)) > 0 )); do
+    slice=$(( slice < CLOCK_RECHECK_S ? slice : CLOCK_RECHECK_S ))
+    sleep "$slice" & running_pid=$!
+    wait "$running_pid" || true
+    running_pid=""
+  done
+}
+
 log "starting: every ${INTERVAL}s, cycle timeout ${TIMEOUT}s, command: $*"
 
 while true; do
@@ -235,7 +273,7 @@ while true; do
     && mv -f "${HEARTBEAT}.tmp" "$HEARTBEAT" \
     || log "WARNING: could not write heartbeat $HEARTBEAT"
 
-  sleep "$INTERVAL" & running_pid=$!
-  wait "$running_pid" || true
-  running_pid=""
+  # Anchored at the END of the cycle — what --interval has always meant here, and what the
+  # --status bar (interval + timeout + 60) is built on. Only the measuring changed.
+  wait_until $(( $(date +%s) + INTERVAL ))
 done
