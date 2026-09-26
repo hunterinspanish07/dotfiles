@@ -25,7 +25,9 @@
 #   3  `status` only: at least one runner is absent or broken (reporting, not failure)
 set -euo pipefail
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolved through symlinks: the documented recovery command is `runner-fleet.sh up`, which
+# reaches this file via the ~/.local/bin link, and the spec lives beside the REAL file.
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 SPEC="${RUNNER_FLEET_SPEC:-$DIR/fleet.conf}"
 LOG_FILE="${RUNNER_FLEET_LOG:-$HOME/.local/share/runner-fleet/fleet.log}"
 # How long to wait for a freshly created runner to register. A verification window with an

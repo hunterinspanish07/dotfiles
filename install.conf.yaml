@@ -43,6 +43,10 @@
     # Kill button: silence the current reply without disabling TTS.
     ~/.claude/hooks/tts-silence.sh:
       path: config/claude/hooks/tts-silence.sh
+    # SessionStart: shows this machine's active ops alarms (config/alerts) at the top of
+    # every session, and flags a watchdog whose heartbeat has gone stale.
+    ~/.claude/hooks/ops-alerts.sh:
+      path: config/claude/hooks/ops-alerts.sh
     # skhd global hotkey (⌃⌥X) that fires the TTS kill button.
     ~/.config/skhd/skhdrc:
       path: config/skhd/skhdrc
@@ -71,6 +75,11 @@
     # ~/.local/bin is already on PATH, same idea as ~/go/bin/litmux above.
     ~/.local/bin/runner-fleet.sh:
       path: config/runner-fleet/runner-fleet.sh
+    # alerts — the one notifier both agents below raise their alarms through: one-shot
+    # desktop banners for events, and held conditions (a parked runner fleet) that the
+    # ops-alerts SessionStart hook shows in every Claude Code session until cleared.
+    ~/.config/alerts:
+      path: config/alerts
     # runner-guard — machine-wide circuit breaker for crash-looping self-hosted CI
     # runners. Links the whole dir so the launchd plist references a stable runtime
     # path (~/.config/runner-guard/runner-guard.sh). Loading the agent is a one-time

@@ -44,12 +44,37 @@ them was detected and back online in **two minutes**, unattended. Poisoned a sec
 inside the cooldown, it was refused a recreate and circuit-broken instead — no retry loop.
 
 The breaker **latches**: once stopped, the container's restart policy is `no`, so on
-later cycles it's classified `parked` — logged so it stays visible, and a container
-that's already stopped is never re-notified. A breaker trips once and stays open; it
-does not re-alert every 2 minutes until you recreate the runner. The one exception is a
+later cycles it's classified `parked`. Only a human clears the latch, and that is
+deliberate — the guard must not fight an operator who stopped something on purpose, and
+unbounded recreation is exactly what the breaker exists to prevent. The one exception is a
 stop left *owed* by a partial heal (policy dropped but the stop failed): the parked
 branch retries that stop each cycle and fires a single confirming alert on the cycle it
-finally lands — then goes quiet.
+finally lands.
+
+## How you find out the fleet is down
+
+A latch that only a human clears is an outage that lasts until a human *knows*. On
+2026-09-06/07 all three runners were circuit-broken at 18:42, 02:17 and 04:30; each fired
+one desktop banner into an empty room, and the guard then logged `parked:` every 120s for
+**four days** until an unrelated PR preflight noticed the runners were offline.
+
+So "the fleet is down" is a **condition**, not an event. Every cycle the guard recomputes
+which runners it has left not serving CI (parked, or rogue and unhealable) and raises the
+`runner-fleet-down` alert through the machine's one notifier (`../alerts`), naming them and
+the fix. That alert:
+
+- shows at the top of **every new Claude Code session** (the `ops-alerts` SessionStart hook)
+  until the fleet is whole — the human sees it, and so does the agent;
+- re-banners on the desktop every 6h while it stays active;
+- is **cleared** only by a complete cycle that finds nothing down — a cycle that could not
+  inspect every container (exit 4) proves nothing and leaves it as it was.
+
+Recovery is `runner-fleet.sh up`; the next cycle clears the alert. If you parked a runner on
+purpose and want the alert gone, remove the container (`docker rm <name>`) — a runner that
+does not exist is not a runner that is down.
+
+The session hook also checks the guard's own heartbeat, so an empty banner can't mean "the
+guard is dead" — a stale heartbeat is shown as its own alert.
 
 Exit codes are a contract, each a distinct outcome: `0` nothing actionable (healthy,
 watching, or parked) · `1` a rogue was found and handled — recreated
@@ -106,3 +131,4 @@ advanced.
 | `RUNNER_FLEET_SCRIPT` | `~/.config/runner-fleet/runner-fleet.sh` | how a rogue gets recreated; if absent, the guard just circuit-breaks |
 | `RUNNER_GUARD_HEAL_COOLDOWN` | `21600` (6h) | minimum seconds between recreate attempts for one runner |
 | `RUNNER_GUARD_HEAL_STATE` | `~/.local/share/runner-guard/heals` | marker dir holding each runner's last heal attempt |
+| `RUNNER_GUARD_ALERTS` | `~/.config/alerts/alerts.sh` | the notifier every alarm goes through |

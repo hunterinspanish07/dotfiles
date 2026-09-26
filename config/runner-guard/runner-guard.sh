@@ -86,13 +86,18 @@ warn() { printf '%s runner-guard: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" | 
 # moment. Fail loud, exit 2. [LAW:no-silent-failure]
 die()  { warn "FATAL: $*"; exit 2; }
 
-# Best-effort desktop alert. Its own failure must never mask a rogue finding, so it
-# is isolated at this boundary and cannot abort the run. [LAW:effects-at-boundaries]
-notify() {
-  local msg="$1"
-  osascript -e "display notification \"${msg//\"/\'}\" with title \"CI runner-guard\"" >/dev/null 2>&1 \
-    || warn "note: desktop notification failed (osascript); alert is in $LOG_FILE"
+# Every alarm goes through the machine's one notifier (config/alerts), shared with
+# ci-janitor. Its failure must never mask a rogue finding, so it is isolated at this
+# boundary and cannot abort the run — but it is never silent either: an alarm that did
+# not go out says so in the log. [LAW:effects-at-boundaries] [LAW:one-source-of-truth]
+ALERTS="${RUNNER_GUARD_ALERTS:-$HOME/.config/alerts/alerts.sh}"
+alerts() {
+  local out
+  out=$("$ALERTS" "$@" 2>&1) && { [[ -z "$out" ]] || warn "note: $out"; return 0; }
+  warn "note: alert NOT raised through $ALERTS ($*): ${out:-no output}"
+  return 1
 }
+notify() { alerts notify "CI runner-guard" "$1" || true; }
 
 # Attempts to replace a rogue runner from the fleet spec. Returns 0 only when the
 # replacement was VERIFIED up by runner-fleet (which holds it for a settle window and
@@ -208,6 +213,7 @@ sleep "$WINDOW_SECS"
 # --- classify and heal --------------------------------------------------------
 rogue_found=0   # a rogue was found and handled: stopped, or detected in CHECK_ONLY
 heal_failed=0   # a rogue was found but the stop did NOT land — it is still live
+down=()         # runners ending this cycle NOT serving CI: parked, or rogue and unhealable
 for i in "${!runners[@]}"; do
   id="${runners[$i]}"
   # Already unreachable at t0 — warned there; carry the skip, don't re-warn or classify.
@@ -241,9 +247,12 @@ for i in "${!runners[@]}"; do
     # cycle had: if the stop failed, the heal is still owed → loud + exit 3. If the stop
     # did real work (pre-stop status wasn't exited: an owed stop finally landing) → that
     # completes a circuit-break, so shout once and count it (rogue_found → exit 1). If it
-    # was already stopped → a benign no-op on a long-parked container → stay silent
-    # (round-3 anti-fatigue). Broken things keep shouting, settled things go quiet.
+    # was already stopped → no new EVENT to announce (round-3 anti-fatigue), but the
+    # runner is still down, and that CONDITION is carried by the fleet-down alert below,
+    # which lasts exactly as long as the outage does. Every outcome of this branch leaves
+    # the runner not serving CI, so it is counted down once, here.
     # [LAW:no-silent-failure] [LAW:types-are-the-program] [LAW:dataflow-not-control-flow]
+    down+=("$name")
     if [[ "$CHECK_ONLY" != "0" ]]; then
       log "parked: $name — not running, restart policy=no (Docker won't resurrect it); not a live crash-loop"
     elif ! err=$(docker stop "$id" 2>&1); then
@@ -271,6 +280,7 @@ for i in "${!runners[@]}"; do
     notify "Healed runner ${name} — recreated from the fleet spec and verified. See ${LOG_FILE}."
   else
     warn "ROGUE: $name — status ${status}, exit ${exit1}, unhealthy ${WINDOW_SECS}s+ (total restarts ${rc1}); circuit-breaking"
+    down+=("$name")   # stopped or still looping, it leaves this cycle not serving CI
     # Drop the always-restart policy first so Docker can't immediately resurrect it,
     # then stop. Left stopped (not removed) so logs survive for the operator to
     # root-cause and recreate. A heal failure on ONE container (concurrently
@@ -298,6 +308,24 @@ for i in "${!runners[@]}"; do
     notify "Stopped rogue runner ${name} (exit ${exit1}, crash-looping). See ${LOG_FILE}."
   fi
 done
+
+# --- the fleet-down condition --------------------------------------------------
+# The latch is deliberate (only a human clears it), so a parked runner is an outage that
+# lasts until someone acts — and on 2026-09-06 it lasted four days because its only trace
+# after one 2 a.m. banner was a `parked:` log line every 120s. The outage is therefore a
+# CONDITION, recomputed from scratch every cycle and held as an active alert that reaches
+# every new Claude Code session until the fleet is whole again. Three outcomes, one per
+# state of our knowledge: runners are down → raise (refreshing the list); a complete look
+# found none → clear; a partial look (exit-4 territory) proves nothing → leave it as it was.
+# CHECK_ONLY holds this effect like every other. [LAW:no-silent-failure] [LAW:effects-at-boundaries]
+if [[ "$CHECK_ONLY" == "0" ]]; then
+  if [[ ${#down[@]} -gt 0 ]]; then
+    alerts raise runner-fleet-down "CI RUNNER FLEET DOWN" \
+      "${#down[@]} self-hosted runner(s) circuit-broken and not serving CI: ${down[*]}. Self-hosted gates will not run until fixed. Root-cause (docker logs <name>; ${LOG_FILE}), then: runner-fleet.sh up" || true
+  elif [[ "$inspect_failed" -eq 0 ]]; then
+    alerts clear runner-fleet-down || true
+  fi
+fi
 
 # Exit precedence, most-severe first — each a distinct outcome a monitor can act on:
 #   3  a known live rogue we couldn't stop (act now) — worst, because it's confirmed
