@@ -4,8 +4,9 @@ every "run the adversarial review on this machine and post the verdict" provider
 needs, with the one thing that genuinely varies factored out into a `Runner`.
 
 Two providers ride this engine: `claude_provider` (Sonnet on the Claude Code
-subscription) and `grok_provider` (grok-4.5 on the xAI subscription via the
-`opencode` CLI). They are behaviorally identical to the skill — same
+subscription) and `grok_provider` (grok on the xAI subscription via the
+`opencode` CLI; its model is the `MODEL` line in that file). They are
+behaviorally identical to the skill — same
 CAPABILITIES, same canonical finding shape, same convergence on the
 `REVIEW_COMPLETE: <N>` trailer (resolve unsupported: the verdict is a PR issue
 comment, not a resolvable thread). Switch between them by editing one value in

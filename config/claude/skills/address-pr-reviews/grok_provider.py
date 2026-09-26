@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """grok PR review provider — runs the adversarial review LOCALLY with the
-`opencode` CLI driving grok-4.5 on the xAI subscription, then posts the verdict
-as a PR issue comment carrying the `REVIEW_COMPLETE: <N>` contract trailer.
+`opencode` CLI driving grok (the model is named once, in `MODEL` below) on the
+xAI subscription, then posts the verdict as a PR issue comment carrying the
+`REVIEW_COMPLETE: <N>` contract trailer.
 
 This is a thin binding of `opencode_local`, the one shared machine for every
 opencode-driven reviewer — invocation, read-only boundary, timeout, verdict
@@ -22,7 +23,7 @@ import opencode_local
 
 # The reviewer model, in opencode's `provider/model` form — the capable xAI
 # model on the subscription. Retune by editing this one line.
-MODEL = "xai/grok-4.6"
+MODEL = "xai/grok-4.7"
 LABEL = "Grok"
 CREDENTIAL = "xAI subscription"
 AUTH_PROVIDER = "xai"
