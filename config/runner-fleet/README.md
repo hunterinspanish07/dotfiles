@@ -36,11 +36,13 @@ PAT missing) · `3` `status` only: something is absent or broken.
 
 ## What `up` guarantees
 
-A create is **not** done when `docker run` returns an id. `odyssey-runner` was created
-successfully, stayed `running`, and sat forever spinning on a session conflict, having never
-reached "Listening for Jobs" — up and useless, indistinguishable by container state from up
-and working. So `up` waits for the runner's own log to say it is listening, and fails closed
-naming the string it looked for. It also refuses any runner that restarts inside the window.
+A create is **not** done when `docker run` returns an id. `up` waits until the runner's
+own log says it is listening, and fails closed naming what it looked for. A
+`Runner connect error: Conflict` line is not that failure — it is a killed runner's
+session still held by GitHub, and `up` keeps waiting for that session to expire. If it
+never does, the error names the stale session, not the token. A runner that never logs
+the retry still fails on the ordinary settle, so a bad token is not made slower. `up`
+also refuses any runner that restarts inside the window.
 
 ## Adding a runner
 

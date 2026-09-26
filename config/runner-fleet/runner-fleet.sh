@@ -30,11 +30,27 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 SPEC="${RUNNER_FLEET_SPEC:-$DIR/fleet.conf}"
 LOG_FILE="${RUNNER_FLEET_LOG:-$HOME/.local/share/runner-fleet/fleet.log}"
-# How long to wait for a freshly created runner to register. A verification window with an
-# owner and a stated meaning — "did it get all the way to listening for jobs" — not a
-# settle-sleep papering over a race: the wait ends the moment the evidence arrives, and
-# only the failure path spends the whole budget. [LAW:no-ambient-temporal-coupling]
+# How long to wait for a freshly created runner to register. The wait ends the moment the
+# log says it is listening; only a failure spends the whole budget. A Conflict retry is
+# not this budget — that line selects the session-expiry ceiling below.
+# [LAW:no-ambient-temporal-coupling]
 SETTLE_SECS="${RUNNER_FLEET_SETTLE:-60}"
+# A killed runner's GitHub session outlives the settle. The replacement logs
+# CONFLICT_MARKER until that session expires — observed ~65s on 2026-09-26, one sample
+# after the settle gave up and blamed the token. While the latest log line is that
+# retry, verify waits until this ceiling and no further. Raising it is
+# RUNNER_FLEET_CONFLICT_CEILING, never a bump of SETTLE_SECS: a runner that never logs
+# the retry must still fail at the settle. [LAW:no-ambient-temporal-coupling]
+CONFLICT_CEILING_SECS="${RUNNER_FLEET_CONFLICT_CEILING:-65}"
+# Budget unit, in seconds. Production sleeps one sample between log reads; a test may
+# set RUNNER_FLEET_POLL_SLEEP=0 and advance the log per call. waited still grows by
+# SAMPLE_SECS, so the budget is denominated in the same seconds either way — the sleep
+# is how long we wait for the next line, not what the budget means.
+# [LAW:no-ambient-temporal-coupling]
+SAMPLE_SECS=5
+POLL_SLEEP_SECS="${RUNNER_FLEET_POLL_SLEEP:-$SAMPLE_SECS}"
+READY_MARKER="Listening for Jobs"
+CONFLICT_MARKER="Runner connect error: Conflict"
 
 # Uniform across every runner, so they are not columns in the spec. A runner that needed
 # a different value here would be a different KIND of runner, and that is a schema
@@ -235,10 +251,12 @@ create_runner() {
   # Stop before removing, and give it time. `docker rm -f` alone sends SIGKILL, which
   # skips the entrypoint's EXIT trap — the one that deregisters the runner with GitHub —
   # and leaves a live session behind under the same RUNNER_NAME. The replacement then
-  # registers fine, connects fine, and spins forever on "A session for this runner
-  # already exists. Runner connect error: Conflict", which looks nothing like the
-  # ungraceful teardown that actually caused it. Observed doing exactly that to
+  # registers fine, connects fine, and retries on CONFLICT_MARKER, which looks nothing
+  # like the ungraceful teardown that caused it. Observed doing exactly that to
   # odyssey-runner on 2026-09-04. SIGTERM first, so the runner hangs up on its own.
+  # A container that is already dead cannot be stopped into deregistering — that
+  # session is already orphaned. verify_runner treats the Conflict line that follows
+  # as the session expiring, and waits out the ceiling instead of blaming the token.
   # [LAW:no-ambient-temporal-coupling]
   log "removing any existing $name (graceful stop first, so it deregisters)"
   docker stop -t 30 "$name" >/dev/null 2>&1 || true
@@ -260,24 +278,24 @@ create_runner() {
   verify_runner "$name"
 }
 
-# A create is not done when docker returns an id; it is done when the runner is still
-# alive after its own startup. The whole outage this script answers began with a
-# container that existed, reported "Up", and was dead. Report the result of a check that
-# was actually run. [LAW:verifiable-goals]
 # A create is done when the runner is REGISTERED AND LISTENING, not when docker returns
-# an id. The distinction is not academic: odyssey-runner was created successfully, stayed
-# `running`, and sat forever in "Obtaining the token of the runner" because its PAT no
-# longer worked — a container that is up and useless, which no amount of inspecting its
-# state can distinguish from one that is up and working. The runner's own log is the only
-# place that fact exists, so that is where it is read from. If a future image changes this
-# wording the check fails CLOSED and names the string it looked for, which is a diagnosable
-# five-second fix; the alternative — assuming success when the evidence is missing — is
-# how a dead fleet reports itself healthy. [LAW:verifiable-goals] [LAW:no-silent-failure]
-READY_MARKER="Listening for Jobs"
+# an id. odyssey-runner was created successfully, stayed `running`, and sat forever in
+# "Obtaining the token of the runner" because its PAT no longer worked — up and useless,
+# indistinguishable by container state from up and working. The log is the only place
+# that fact exists. If a future image changes the wording, the check fails CLOSED and
+# names the string it looked for; assuming success when the evidence is missing is how
+# a dead fleet reports itself healthy. [LAW:verifiable-goals] [LAW:no-silent-failure]
+#
+# A Conflict retry is a different fact, and it is progress. The loop below always
+# samples; the latest line selects the budget. Conflict means GitHub still holds the
+# killed runner's session, so the budget is the ceiling. Anything else is the settle.
+# A timeout whose latest line is still the retry names that session — the token hint
+# there is the lie this function used to tell. [LAW:dataflow-not-control-flow]
 verify_runner() {
-  local name="$1" waited=0 s status exitcode rc
-  while [[ "$waited" -lt "$SETTLE_SECS" ]]; do
-    sleep 5; waited=$((waited+5))
+  local name="$1" waited=0 budget="$SETTLE_SECS" s status exitcode rc logs latest
+  while [[ "$waited" -lt "$budget" ]]; do
+    sleep "$POLL_SLEEP_SECS"
+    waited=$((waited + SAMPLE_SECS))
     if ! s=$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}} {{.RestartCount}}' "$name" 2>/dev/null); then
       warn "VERIFY FAILED: $name disappeared ${waited}s after creation"
       return 1
@@ -291,13 +309,28 @@ verify_runner() {
       docker logs --tail 15 "$name" 2>&1 | sed 's/^/    /' >&2
       return 1
     fi
-    if docker logs "$name" 2>&1 | grep -q "$READY_MARKER"; then
+    if ! logs=$(docker logs "$name" 2>&1); then
+      warn "VERIFY FAILED: $name: could not read its log ${waited}s after creation"
+      return 1
+    fi
+    if grep -q "$READY_MARKER" <<< "$logs"; then
       log "verified: $name registered and is listening for jobs (${waited}s, 0 restarts)"
       return 0
     fi
+    latest="${logs##*$'\n'}"
+    if [[ "$latest" == *"$CONFLICT_MARKER"* ]]; then
+      budget="$CONFLICT_CEILING_SECS"
+    else
+      budget="$SETTLE_SECS"
+    fi
   done
-  warn "VERIFY FAILED: $name never logged '$READY_MARKER' within ${SETTLE_SECS}s (status ${status}, restarts ${rc})."
-  warn "  Most often this is the PAT: it must be a fine-grained token for that repo with Administration: Read & write."
+  if [[ "$latest" == *"$CONFLICT_MARKER"* ]]; then
+    warn "VERIFY FAILED: $name still reporting a stale GitHub session ('$CONFLICT_MARKER') after ${waited}s."
+    warn "  The previous runner was not deregistered (it was killed, not stopped), so GitHub rejects the new session until the old one expires. This wait is capped at ${CONFLICT_CEILING_SECS}s."
+  else
+    warn "VERIFY FAILED: $name never logged '$READY_MARKER' within ${SETTLE_SECS}s (status ${status}, restarts ${rc})."
+    warn "  Most often this is the PAT: it must be a fine-grained token for that repo with Administration: Read & write."
+  fi
   docker logs --tail 15 "$name" 2>&1 | sed 's/^/    /' >&2
   return 1
 }
@@ -354,6 +387,11 @@ cmd_plan() {
 
 cmd_up() {
   local force=0
+  # A ceiling that does not extend the wait recreates the false token failure, and
+  # would do it after the container already exists: up exits 1, naming the wrong
+  # cause. Refuse before any pull, stop, or create. [LAW:no-silent-failure]
+  [[ "$CONFLICT_CEILING_SECS" -gt "$SETTLE_SECS" ]] \
+    || die "RUNNER_FLEET_CONFLICT_CEILING ($CONFLICT_CEILING_SECS) must be above the settle window ($SETTLE_SECS)"
   [[ "${1:-}" == "--force" ]] && { force=1; shift; }
   select_runners "$@"
   classify_selected
