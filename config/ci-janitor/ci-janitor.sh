@@ -144,9 +144,12 @@ done
 # caller's. [LAW:effects-at-boundaries]
 log()  { printf '%s ci-janitor: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" | tee -a "$LOG_FILE" || true; }
 warn() { printf '%s ci-janitor: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" | tee -a "$LOG_FILE" >&2 || true; }
+# Alarms go through the machine's one notifier (config/alerts), shared with runner-guard.
+# A notifier failure is reported, never allowed to abort the sweep. [LAW:one-source-of-truth]
+ALERTS="${CI_JANITOR_ALERTS:-$HOME/.config/alerts/alerts.sh}"
 notify() {
-  osascript -e "display notification \"${1//\"/\'}\" with title \"CI janitor\"" >/dev/null 2>&1 \
-    || warn "note: desktop notification failed (osascript); the alert is in $LOG_FILE"
+  "$ALERTS" notify "CI janitor" "$1" \
+    || warn "note: notifier failed ($ALERTS); the alert is in $LOG_FILE"
 }
 # Docker being unreachable is the janitor failing, not the disk being clean. Reporting
 # success here is the silent-fallback trap this script exists to prevent. [LAW:no-silent-failure]

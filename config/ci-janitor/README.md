@@ -76,7 +76,8 @@ margin) are refused at startup. A free dial that accepted `1` would make sweep 1
 
 Silent accumulation is what caused the original problem, so the janitor is built to be
 loud about its own failure. Every non-zero exit from a **run** both logs and raises a
-desktop notification (exit 64 is the deliberate exception — a mistyped flag at a
+desktop notification through the machine's one notifier (`../alerts`, shared with
+runner-guard) (exit 64 is the deliberate exception — a mistyped flag at a
 terminal, where stderr is already on screen). Two checks catch what a sweep-only
 janitor would miss:
 
@@ -136,6 +137,7 @@ All optional; the defaults are the tested ones.
 | `CI_JANITOR_LOG` | `~/.local/share/ci-janitor/janitor.log` | Log path |
 | `CI_JANITOR_STATE` | `~/.local/share/ci-janitor/last-run` | Last run stamp (agent showed up — not “sweep was clean”) |
 | `CI_JANITOR_DOCKER_DISK` | `/var/lib/docker` | Filesystem the high-water check reads |
+| `CI_JANITOR_ALERTS` | `~/.config/alerts/alerts.sh` | The notifier alarms go through |
 
 ## The related fix
 
