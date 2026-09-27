@@ -201,7 +201,7 @@ Then **STOP**. Do NOT merge, do NOT `lit done` (the ticket is not merged — its
 
 Hunter has granted bounded autonomy for this ticket. Run the close-out — merge, close, recap — then chain the next eligible ticket in the grant's pool.
 
-[LAW:one-source-of-truth] **follow the tooling's runtime guidance.** Each step's tool (`gh pr merge`, `lit done`, `/recap`) emits its own instructions at runtime — preview tokens, next-step hints, branch-protection messages, admin-bypass prompts, apply-token strings, output paths. The skill describes the *shape* of each step; the tool itself is the authoritative source for *how* to follow through. Read what the tool prints and do what it says — don't paper over a warning, don't guess past a prompt, don't substitute the skill's wording when the tool gave you a literal token or path to use.
+[LAW:one-source-of-truth] **follow the tooling's runtime guidance.** Each step's tool (`gh pr merge`, `lit done`, `/recap`) emits its own instructions at runtime — preview tokens, next-step hints, branch-protection messages, admin-bypass prompts, output paths. The skill describes the *shape* of each step; the tool itself is the authoritative source for *how* to follow through. Read what the tool prints and do what it says — don't paper over a warning, don't guess past a prompt, don't substitute the skill's wording when the tool gave you a literal token or path to use. `lit done` is single-phase: it does not print an apply token, and `--apply` is not a flag it accepts. Do not invent a second invocation because an older skill told you to.
 
 #### A. Refresh onto the live integration branch, then merge
 
@@ -249,7 +249,7 @@ git worktree remove "$MAIN/.claude/worktrees/$TICKET_ID" --force
 lit done "$TICKET_ID"
 ```
 
-The ticket is the one this PR closed — pull it from the PR body, branch name, or the ticket you were working on in this session, and assign it to `$TICKET_ID`. The code block above is the canonical case: a confidently identified `$TICKET_ID`. Don't run `lit done` with an empty, guessed, or unverified value. `lit done` is a two-phase transition: the first call prints a preview with an apply token; capture it as `$TOKEN` and rerun with `--apply="$TOKEN"` to commit. For an out-of-band PR with no associated lit ticket, Step B is a no-op — skip the command entirely and note the missing-ticket case in the recap so the next agent sees it.
+The ticket is the one this PR closed — pull it from the PR body, branch name, or the ticket you were working on in this session, and assign it to `$TICKET_ID`. The code block above is the canonical case: a confidently identified `$TICKET_ID`. Don't run `lit done` with an empty, guessed, or unverified value. One invocation closes the ticket. There is no preview and no `--apply` token — if the close did not happen, read the error and stop; do not rerun with `--apply`. For an out-of-band PR with no associated lit ticket, Step B is a no-op — skip the command entirely and note the missing-ticket case in the recap so the next agent sees it.
 
 #### C. Recap the merged work
 

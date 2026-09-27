@@ -36,6 +36,7 @@ error fails safe toward the human-gated default rather than toward auto-merge.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
@@ -137,19 +138,49 @@ def write_grant(directory, grant):
     return path
 
 
+# [LAW:one-source-of-truth] `lit workspace` prints `key: value` lines and nothing
+# else. --json was removed; this pattern is the seam, not a second format.
+_WORKSPACE_FIELD = re.compile(r"^([a-z0-9_]+): (.*)$")
+
+
+def parse_workspace_text(text):
+    """Parse `lit workspace` stdout into a field dict.
+
+    Split on the first ': ' so a value may itself contain colons. A line that
+    is not a field is a format break, not noise — skipping it would hide a
+    missing workspace_id behind a later, vaguer failure.
+    [LAW:no-silent-failure]
+    """
+    if not text or not text.strip():
+        raise ValueError("lit workspace produced no output")
+    fields = {}
+    for line in text.splitlines():
+        if line == "":
+            continue
+        match = _WORKSPACE_FIELD.match(line)
+        if not match:
+            raise ValueError(f"lit workspace line is not 'key: value': {line!r}")
+        key, value = match.group(1), match.group(2)
+        if key in fields:
+            raise ValueError(f"lit workspace repeated field {key!r}")
+        fields[key] = value
+    return fields
+
+
 def resolve_workspace_id(explicit):
     """The grant key. Explicit override exists for testing on a scratch case;
     production resolves it from lit so the key is computed in exactly one way."""
     if explicit:
         return explicit
-    proc = subprocess.run(
-        ["lit", "workspace", "--json"], capture_output=True, text=True
-    )
+    proc = subprocess.run(["lit", "workspace"], capture_output=True, text=True)
     if proc.returncode != 0:
-        raise SystemExit(
-            f"autonomy-grant: `lit workspace --json` failed: {proc.stderr.strip()}"
-        )
-    workspace_id = json.loads(proc.stdout).get("workspace_id")
+        detail = proc.stderr.strip() or proc.stdout.strip()
+        raise SystemExit(f"autonomy-grant: `lit workspace` failed: {detail}")
+    try:
+        fields = parse_workspace_text(proc.stdout)
+    except ValueError as exc:
+        raise SystemExit(f"autonomy-grant: {exc}") from exc
+    workspace_id = fields.get("workspace_id")
     if not workspace_id:
         raise SystemExit("autonomy-grant: lit workspace returned no workspace_id")
     return workspace_id
@@ -297,7 +328,7 @@ def build_parser():
     parser.add_argument(
         "--workspace-id",
         default=None,
-        help="override the lit workspace id (default: `lit workspace --json`)",
+        help="override the lit workspace id (default: parse `lit workspace`)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

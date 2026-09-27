@@ -21,7 +21,7 @@ The authority is a **grant**: a durable file recording the FROZEN set of ticket 
 
 [LAW:dataflow-not-control-flow] the argument selects one arm; the body of each arm is fixed.
 
-- `/auto status` → run `~/.claude/skills/lib/autonomy-grant.py status` and relay it. Add live context: which pending tickets are still in `lit ready`, and any **open** tickets created *after* `granted_at` (not in scope — they will NOT be auto-run; name them so Hunter can `/auto stop` + re-`/auto` to include them). Done.
+- `/auto status` → run `~/.claude/skills/lib/autonomy-grant.py status` and relay it. Add live context: which pending tickets `lit backlog` still shows as workable (`lit next` is the single leaf), and any **open** tickets created *after* `granted_at` (not in scope — they will NOT be auto-run; name them so Hunter can `/auto stop` + re-`/auto` to include them). Done.
 - `/auto stop` → run `~/.claude/skills/lib/autonomy-grant.py stop`, confirm the grant is retired. Done.
 - `/auto` (no arg) or `/auto <epic|label>` → run the **triage → grant** flow below. The optional argument narrows the candidate set; absence triages the whole ready backlog.
 
@@ -32,15 +32,17 @@ Hunter must NOT have to name an epic or know the backlog. You do the reading and
 ### 1. Build the candidate set
 
 ```bash
-lit ready                                   # the human-readable overview, for your context
-lit queue --status open --limit 50 --json   # the machine-readable candidate list
+# WRONG — both retired. `lit ready` and `lit queue` exit 3. `--json` is an
+# unknown flag; passing it fails the command. Text is the interface. Do not
+# reach for either because you want a machine-readable list.
+lit backlog --status open --limit 50
 ```
 
-For `/auto <epic|label>`, narrow first: `lit queue --status open --labels <label> --json`, or filter the queue to the named epic/topic. Tickets already labeled **`auto-hold`** are pre-excluded curation from a prior triage — keep them held and do NOT re-judge them; just carry their hold into the presentation.
+For `/auto <epic|label>`, narrow first: `lit backlog --status open --labels <label>`, or filter the backlog to the named epic/topic. Tickets already labeled **`auto-hold`** are pre-excluded curation from a prior triage — keep them held and do NOT re-judge them; just carry their hold into the presentation.
 
 ### 2. Triage each candidate — default autonomous, the exception is argued
 
-[LAW:dataflow-not-control-flow] every candidate gets the same read; the classification is a *value* (`autonomous-OK` | `keep-human` + reason), not a branch you skip. Read each ticket (`lit show <id> --json`) — enough to judge blast radius and whether a fresh agent could finish it unattended.
+[LAW:dataflow-not-control-flow] every candidate gets the same read; the classification is a *value* (`autonomous-OK` | `keep-human` + reason), not a branch you skip. Read each ticket (`lit show <id>` — no `--json`) — enough to judge blast radius and whether a fresh agent could finish it unattended.
 
 **Default = autonomous-OK** (tests, docs, internal refactors with tests, low-blast changes). Flag **keep-human** only when the ticket trips the rubric, and give a SPECIFIC one-line reason naming the actual hazard:
 

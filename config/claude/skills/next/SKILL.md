@@ -15,7 +15,7 @@ If the user provided specific information (e.g., a ticket id or area of the code
 
 ## Finding work
 
-Take a look at the backlog (`lit ready`) so you understand what work is in-progress or up next.  Now you need to decide whether you need to wrap up in-progress work or start new work.
+Take a look at the backlog (`lit backlog`) so you understand what work is in-progress or up next.  Now you need to decide whether you need to wrap up in-progress work or start new work.
 
 ### In progress work
 
@@ -46,9 +46,11 @@ Check for open PRs related to your current branch?  If there are, THIS IS YOUR T
 
 We'll proceed with pulling from the backlog, but Open PRs are still relevant - you want to ensure you're building on old code or going to have significant merge conflicts.  But check this after you pull a ticket.
 
-#### lit ready
+#### lit backlog / lit next
 
-Lit ready shows an overview of the epics and the top ticket in each epic, as well as any in-progress or orphaned tickets.
+`lit ready` and `lit queue` are retired — they exit 3 and point at the replacements. Do not call them, and do not pass `--json`. You will think "I need the machine-readable list, so `--json`." That flag is unknown; the command fails. Text is the interface.
+
+`lit backlog` is the ranked queue, blocked items inline, with why. `lit orphaned` lists abandoned in-progress tickets. `lit next` prints the single leaf to `lit start`.
 
 **If an autonomy grant is active, scope the pool first.** Before choosing anything, ask the single grant authority — read-only here; `/auto` and `address-pr-reviews` own the grant's lifecycle, `next` only reads it:
 
@@ -57,11 +59,11 @@ Lit ready shows an overview of the epics and the top ticket in each epic, as wel
 ~/.claude/skills/lib/autonomy-grant.py pending     # if so, the exact eligible ticket ids
 ```
 
-When a grant is active, your candidate set is exactly its `pending` tickets intersected with what `lit ready` shows as actually workable — [LAW:single-enforcer] the grant is the one authority for what autonomy may touch, so a bottle's `/next` can never wander outside the authorized pool. Choose within that scoped set using the normal ordering below (orphaned first, then top of ready). If the scoped set is empty — every pending ticket is blocked, or the pool has drained — STOP and report what is pending-but-blocked; do NOT fall back to an unauthorized ticket. (A ticket id you were explicitly handed overrides this scoping — a human naming a ticket is a human decision, not autonomous picking.)
+When a grant is active, your candidate set is exactly its `pending` tickets intersected with what `lit backlog` shows as actually workable (`lit next` is the single leaf) — [LAW:single-enforcer] the grant is the one authority for what autonomy may touch, so a bottle's `/next` can never wander outside the authorized pool. Choose within that scoped set using the normal ordering below (orphaned first, then `lit next`). If the scoped set is empty — every pending ticket is blocked, or the pool has drained — STOP and report what is pending-but-blocked; do NOT fall back to an unauthorized ticket. (A ticket id you were explicitly handed overrides this scoping — a human naming a ticket is a human decision, not autonomous picking.)
 
 If there are any orphaned tickets, pull from those first.  Those tickets are abandoned and need someone to finish them.  
 
-If there aren't any other tickets to pick up, take from the top of the ready queue.
+If there aren't any other tickets to pick up, take what `lit next` prints.
 
 3. **Read the ticket fully.** Title, description, acceptance criteria, comments, linked PRs, linked tickets. If the ticket references a spec, doc, or prior PR, read that too. You are about to author code that claims to satisfy this ticket — earn the right to claim it.
 

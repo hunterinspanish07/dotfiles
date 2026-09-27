@@ -16,8 +16,9 @@ pass would churn rank or rewrite bodies again, the first pass over- or under-rea
 
 Run `lit quickstart` if you haven't this session — it defines the commands below.
 Then read the whole working set before changing anything: `lit backlog` (full
-rank-ordered view with the dependency rationale) and `lit ready` (what's actually
-pullable). For every epic in scope, `lit show <epic-id>` prints its plan.
+rank-ordered view with the dependency rationale) and `lit next` (the single
+pullable leaf). `lit ready` is retired — it exits 3; do not call it. For every
+epic in scope, `lit show <epic-id>` prints its plan.
 
 **Scope:** default is the entire workable backlog. If the user passed an epic id or
 topic slug, restrict every pass to that subtree / topic and say so in the report.
@@ -35,7 +36,7 @@ top-to-bottom — rank is *relative*, so build the global picture first, then mu
 3. **Detail is calibrated to distance-from-pull** (the core judgment — see below).
 4. **Structure doesn't lie.** Blocked items are *really* blocked; missing dependency
    edges that should gate readiness are added; parentage and epic membership are correct.
-   `lit ready` must be trustworthy — a backlog whose "ready" is wrong is worse than none.
+   What `lit next` would hand you must be trustworthy — a queue whose head is wrong is worse than none.
 5. **Every near-term ticket has a verifiable "done"** — a concrete acceptance criterion
    a deterministic check could judge. No testable done → not groomed, however nice the prose.
 6. **Dead tickets are closed**, not carried.
@@ -105,12 +106,16 @@ decisions, that's a `needs-design` block to surface — not a place to invent th
 
 1. **Structural.** Fix the graph first, because it determines what's truly ready and
    therefore how rank should read. Remove false blocks (`lit label rm <id> needs-design`
-   where the blocker is gone), add real dependency edges (`lit dep add <blocker> <blocked>
-   --type blocks`) so unstartable work stops surfacing as ready, correct parentage
-   (`lit parent set`). Topic is immutable — never try to change it.
+   where the blocker is gone), add real dependency edges
+   (`lit dep add --from <blocker> --to <blocked>`; there is no positional form)
+   so unstartable work stops surfacing as ready, correct parentage
+   (`lit parent set --child <id> --parent <id>`). Topic is immutable — never try to change it.
 
 2. **Staleness.** Identify obsolete / already-done / duplicate tickets and **close** them
-   (`lit close <id> --reason "..."`; reason = wontfix | obsolete | duplicate). Close is
+   (`lit close <id> --resolution <obsolete|wontfix|duplicate|superseded>`;
+   duplicate and superseded also require `--of <canonical-id>`. `--reason` is
+   optional prose, not the resolution — a close without `--resolution` is a
+   usage error). Close is
    reversible (`lit open`), so it's safe to do autonomously — the report is the undo trail.
    **Never `delete` autonomously.** If something looks like it should be deleted rather than
    closed, leave it and list it under "needs your call" in the report.
