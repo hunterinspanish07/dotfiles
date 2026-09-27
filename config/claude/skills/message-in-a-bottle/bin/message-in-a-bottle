@@ -23,7 +23,7 @@ BOTTLE_DELAY_SECONDS="${BOTTLE_DELAY_SECONDS:-10}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-1}"
 IDLE_WAIT_SECONDS="${IDLE_WAIT_SECONDS:-20}"      # max wait for idle before reset
 VERIFY_TIMEOUT_SECONDS="${VERIFY_TIMEOUT_SECONDS:-20}" # max wait for reset banner
-BUSY_WAIT_SECONDS="${BUSY_WAIT_SECONDS:-900}"     # max wait for idle after reset
+BUSY_LOG_SECONDS="${BUSY_LOG_SECONDS:-300}"       # progress-log cadence while busy
 
 # [LAW:no-silent-failure] non-positive poll interval makes the wait counters
 # stall at 0 forever (bash integer math). Reject at the boundary once.
@@ -39,8 +39,8 @@ esac
 case "$VERIFY_TIMEOUT_SECONDS" in
   ''|*[!0-9]*) echo "VERIFY_TIMEOUT_SECONDS must be a non-negative integer (got: ${VERIFY_TIMEOUT_SECONDS})" >&2; exit 2 ;;
 esac
-case "$BUSY_WAIT_SECONDS" in
-  ''|*[!0-9]*) echo "BUSY_WAIT_SECONDS must be a non-negative integer (got: ${BUSY_WAIT_SECONDS})" >&2; exit 2 ;;
+case "$BUSY_LOG_SECONDS" in
+  ''|*[!0-9]*|0) echo "BUSY_LOG_SECONDS must be a positive integer (got: ${BUSY_LOG_SECONDS})" >&2; exit 2 ;;
 esac
 
 # [LAW:one-source-of-truth] the static framing wrapped around the agent's message
@@ -330,20 +330,22 @@ case "$MODE" in
     # [LAW:no-ambient-temporal-coupling] idle is the owned state before the
     # reset is judged or anything is typed: a reset typed into a busy pane runs
     # only once the agent goes idle, and /compact shows its marker while still
-    # running. The bound is generous (a big /compact takes minutes) and exists
-    # so that a busy read which never clears cannot hang the worker silently.
-    # Each call gets the full budget (a long turn must not starve the wait
-    # that outlasts /compact); busy_waited only totals for the log. Past the
-    # bound the pane is judged "busy" below and never pasted into.
+    # running. Unbounded on purpose: nothing is ever typed into a busy pane
+    # (measured live: a note queued behind a pending /clear is dropped when
+    # the clear runs), and giving up would strand a reset that is still queued.
+    # Busy is the column-0 spinner only, so this waits on a live turn, not on
+    # transcript text. Progress is logged every BUSY_LOG_SECONDS so a long wait
+    # is never silent. The worker is detached; kill it to cancel.
     # [LAW:no-silent-failure]
     busy_waited=0
     await_idle() {
-      local w=0
-      while pane_busy && [ "$w" -lt "$BUSY_WAIT_SECONDS" ]; do
+      while pane_busy; do
         sleep "$POLL_INTERVAL_SECONDS"
-        w=$((w + POLL_INTERVAL_SECONDS))
+        busy_waited=$((busy_waited + POLL_INTERVAL_SECONDS))
+        if [ $((busy_waited % BUSY_LOG_SECONDS)) -eq 0 ]; then
+          log "still busy after ${busy_waited}s; waiting for idle"
+        fi
       done
-      busy_waited=$((busy_waited + w))
     }
     # [LAW:dataflow-not-control-flow] the same four waits run every time; each
     # returns at once when its condition already holds. The second pair catches
@@ -352,11 +354,11 @@ case "$MODE" in
     await_idle
     await_reset
     await_idle
-    # [LAW:types-are-the-program] the pane is judged once into a closed set;
-    # the paste is reachable only from "ready" (reset registered AND idle).
-    if ! pane_reset; then PANE_STATE=not_reset
-    elif pane_busy;  then PANE_STATE=busy
-    else                  PANE_STATE=ready
+    # [LAW:types-are-the-program] the waits above leave the pane idle, so
+    # the only open question is whether the reset registered: ready (paste)
+    # or not_reset (note). No keystroke below ever lands on a busy pane.
+    if pane_reset; then PANE_STATE=ready
+    else                PANE_STATE=not_reset
     fi
     log "reset check after ${verify_waited}s (idle wait ${busy_waited}s): $PANE_STATE"
 
@@ -472,12 +474,6 @@ case "$MODE" in
           fi
         fi
       fi
-    elif [ "$PANE_STATE" = busy ]; then
-      # Reset ran but the pane never went idle within the bound. Never paste
-      # into it; the short note queues behind the running turn and the
-      # handoff file stays for it.
-      log "MISFIRE: /$RESET registered but pane still busy past ${BUSY_WAIT_SECONDS}s; message NOT pasted"
-      tell_misfire "/$RESET ran but the pane stayed busy, so the handoff was not pasted"
     else
       # Idle with no marker after the second wait: the reset was genuinely
       # swallowed and nothing is queued to fire late, so the note lands in this
