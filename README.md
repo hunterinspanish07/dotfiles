@@ -34,7 +34,7 @@ untouched.
 
 The `lit` agent-native workflow ([links-issue-tracker](https://github.com/promptctl/links-issue-tracker)):
 
-- **`next`** — pull the next ready ticket and start work (`lit ready` → `lit start`).
+- **`next`** — pull the next ready ticket and start work (`lit next` → `lit start`).
 - **`plan-feature`** — interview an idea, decompose into small `lit` tickets with
   machine-verifiable Definitions of Done, and stop for human approval (Gate 1)
   before filing.

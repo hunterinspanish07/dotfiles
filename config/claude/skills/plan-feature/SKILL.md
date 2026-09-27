@@ -67,13 +67,14 @@ Only now create the tickets, following `lit quickstart new`:
 - One ticket per unit, with the title, description, and DoD from the approved
   plan. For a multi-ticket epic, `lit import` a JSON tree in one shot; for a
   few, `lit new` each.
-- Wire structure explicitly: `lit parent` / `lit dep` for the dependencies you
-  identified, and `lit rank` so the queue reflects the agreed order.
+- Wire structure explicitly: `lit parent set --child <id> --parent <id>` and
+  `lit dep add --from <blocker> --to <blocked>` (no positional form) for the
+  dependencies you identified, and `lit rank` so the queue reflects the agreed order.
 - Echo back the created ticket IDs mapped to the plan so the human can see the
   plan became the backlog faithfully.
 
 ## 5. Hand off — do not auto-start
 
-Surface the top ready ticket (`lit ready`) so the next step is obvious, then
+Surface the top ready ticket (`lit next` — `lit ready` is retired and exits 3) so the next step is obvious, then
 **stop**. Starting work is `/next`'s job and, in supervised mode, the human's
 call — never auto-start the first ticket from here.
