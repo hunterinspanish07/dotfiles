@@ -332,17 +332,18 @@ case "$MODE" in
     # only once the agent goes idle, and /compact shows its marker while still
     # running. The bound is generous (a big /compact takes minutes) and exists
     # so that a busy read which never clears cannot hang the worker silently.
-    # Past it the worker logs and continues: a paste or note sent to a busy
-    # agent is queued and delivered after its turn. [LAW:no-silent-failure]
+    # Each call gets the full budget (a long turn must not starve the wait
+    # that outlasts /compact); busy_waited only totals for the log. Past the
+    # bound the pane is judged "busy" below and never pasted into.
+    # [LAW:no-silent-failure]
     busy_waited=0
     await_idle() {
-      while pane_busy && [ "$busy_waited" -lt "$BUSY_WAIT_SECONDS" ]; do
+      local w=0
+      while pane_busy && [ "$w" -lt "$BUSY_WAIT_SECONDS" ]; do
         sleep "$POLL_INTERVAL_SECONDS"
-        busy_waited=$((busy_waited + POLL_INTERVAL_SECONDS))
+        w=$((w + POLL_INTERVAL_SECONDS))
       done
-      if pane_busy; then
-        log "still busy after ${busy_waited}s idle wait; continuing (input will queue)"
-      fi
+      busy_waited=$((busy_waited + w))
     }
     # [LAW:dataflow-not-control-flow] the same four waits run every time; each
     # returns at once when its condition already holds. The second pair catches
@@ -351,11 +352,15 @@ case "$MODE" in
     await_idle
     await_reset
     await_idle
-    log "reset check after ${verify_waited}s (idle wait ${busy_waited}s)"
+    # [LAW:types-are-the-program] the pane is judged once into a closed set;
+    # the paste is reachable only from "ready" (reset registered AND idle).
+    if ! pane_reset; then PANE_STATE=not_reset
+    elif pane_busy;  then PANE_STATE=busy
+    else                  PANE_STATE=ready
+    fi
+    log "reset check after ${verify_waited}s (idle wait ${busy_waited}s): $PANE_STATE"
 
-    # [LAW:types-are-the-program] paste is reachable only after the reset
-    # registered AND the pane is idle — both established above.
-    if pane_reset; then
+    if [ "$PANE_STATE" = ready ]; then
       # [LAW:types-are-the-program] bracketed paste keeps newlines (body may
       # collapse to a chip). Enter requires a paste-only delta (not keystrokes):
       # novel PREFIX (absent before this paste), chip multiset increase, or the
@@ -467,6 +472,12 @@ case "$MODE" in
           fi
         fi
       fi
+    elif [ "$PANE_STATE" = busy ]; then
+      # Reset ran but the pane never went idle within the bound. Never paste
+      # into it; the short note queues behind the running turn and the
+      # handoff file stays for it.
+      log "MISFIRE: /$RESET registered but pane still busy past ${BUSY_WAIT_SECONDS}s; message NOT pasted"
+      tell_misfire "/$RESET ran but the pane stayed busy, so the handoff was not pasted"
     else
       # Idle with no marker after the second wait: the reset was genuinely
       # swallowed and nothing is queued to fire late, so the note lands in this
