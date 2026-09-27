@@ -69,16 +69,19 @@ case "$1" in
     printf '%s\n' "$n" > "$STUB/log_calls"
     [[ "$n" -le 40 ]] || { echo "stub: verify polled $n times — the ceiling was not enforced" >&2; exit 1; }
     phase=$(cat "$STUB/phase")
-    conflict="A session for this runner already exists. Runner connect error: Conflict. Retrying until reconnected."
+    # The live runner (grounded-runner, 2026-09-26) prints the conflict line and
+    # then keeps logging "√ Connected to GitHub". The conflict is in the log; it
+    # is not the last line. A last-line check misses it and blames the token.
+    conflict="Runner connect error: Error: Conflict. Retrying until reconnected."
     case "$phase" in
       recover)
         if [[ "$n" -le 12 ]]; then
-          printf '%s\n' "Connected to GitHub" "$conflict"
+          printf '%s\n' "A session for this runner already exists." "$conflict" "√ Connected to GitHub"
         else
-          printf '%s\n' "$conflict" "Runner reconnected. Listening for Jobs"
+          printf '%s\n' "$conflict" "√ Connected to GitHub" "Runner reconnected." "Listening for Jobs"
         fi
         ;;
-      stuck) printf '%s\n' "Connected to GitHub" "$conflict" ;;
+      stuck) printf '%s\n' "A session for this runner already exists." "$conflict" "√ Connected to GitHub" ;;
       silent) printf '%s\n' "Obtaining the token of the runner" ;;
       *) echo "stub: unknown phase '$phase'" >&2; exit 1 ;;
     esac

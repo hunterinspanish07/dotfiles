@@ -38,7 +38,7 @@ PAT missing) · `3` `status` only: something is absent or broken.
 
 A create is **not** done when `docker run` returns an id. `up` waits until the runner's
 own log says it is listening, and fails closed naming what it looked for. A
-`Runner connect error: Conflict` line is not that failure — it is a killed runner's
+`Conflict. Retrying until reconnected.` line is not that failure — it is a killed runner's
 session still held by GitHub, and `up` keeps waiting for that session to expire. If it
 never does, the error names the stale session, not the token. A runner that never logs
 the retry still fails on the ordinary settle, so a bad token is not made slower. `up`

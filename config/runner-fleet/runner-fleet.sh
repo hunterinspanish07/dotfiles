@@ -37,10 +37,12 @@ LOG_FILE="${RUNNER_FLEET_LOG:-$HOME/.local/share/runner-fleet/fleet.log}"
 SETTLE_SECS="${RUNNER_FLEET_SETTLE:-60}"
 # A killed runner's GitHub session outlives the settle. The replacement logs
 # CONFLICT_MARKER until that session expires — observed ~65s on 2026-09-26, one sample
-# after the settle gave up and blamed the token. While the latest log line is that
-# retry, verify waits until this ceiling and no further. Raising it is
-# RUNNER_FLEET_CONFLICT_CEILING, never a bump of SETTLE_SECS: a runner that never logs
-# the retry must still fail at the settle. [LAW:no-ambient-temporal-coupling]
+# after the settle gave up and blamed the token. Once that line has appeared, verify
+# holds this ceiling until the runner is listening or the ceiling is spent. A later
+# line does not drop it: the live log prints "√ Connected to GitHub" after the
+# conflict line, so a last-line check misses the retry at the one sample that could
+# extend the wait. Raising the ceiling is RUNNER_FLEET_CONFLICT_CEILING, never a bump
+# of SETTLE_SECS. [LAW:no-ambient-temporal-coupling]
 CONFLICT_CEILING_SECS="${RUNNER_FLEET_CONFLICT_CEILING:-65}"
 # Budget unit, in seconds. Production sleeps one sample between log reads; a test may
 # set RUNNER_FLEET_POLL_SLEEP=0 and advance the log per call. waited still grows by
@@ -50,7 +52,10 @@ CONFLICT_CEILING_SECS="${RUNNER_FLEET_CONFLICT_CEILING:-65}"
 SAMPLE_SECS=5
 POLL_SLEEP_SECS="${RUNNER_FLEET_POLL_SLEEP:-$SAMPLE_SECS}"
 READY_MARKER="Listening for Jobs"
-CONFLICT_MARKER="Runner connect error: Conflict"
+# The live line is "Runner connect error: Error: Conflict. Retrying until reconnected."
+# The ticket's paraphrase omitted "Error: ". This fragment is in both, and in nothing
+# else the runner prints. [LAW:one-source-of-truth]
+CONFLICT_MARKER="Conflict. Retrying until reconnected."
 
 # Uniform across every runner, so they are not columns in the spec. A runner that needed
 # a different value here would be a different KIND of runner, and that is a schema
@@ -286,13 +291,14 @@ create_runner() {
 # names the string it looked for; assuming success when the evidence is missing is how
 # a dead fleet reports itself healthy. [LAW:verifiable-goals] [LAW:no-silent-failure]
 #
-# A Conflict retry is a different fact, and it is progress. The loop below always
-# samples; the latest line selects the budget. Conflict means GitHub still holds the
-# killed runner's session, so the budget is the ceiling. Anything else is the settle.
-# A timeout whose latest line is still the retry names that session — the token hint
-# there is the lie this function used to tell. [LAW:dataflow-not-control-flow]
+# A Conflict retry is a different fact, and it is progress. The loop always samples.
+# Once the log has contained the retry, the budget is the ceiling for the rest of
+# the verify — a later line that is neither the retry nor listening does not erase
+# it. The token hint is only for a log that never contained the marker: conflict is
+# logged after registration, so the token already worked. [LAW:dataflow-not-control-flow]
+# [LAW:no-silent-failure]
 verify_runner() {
-  local name="$1" waited=0 budget="$SETTLE_SECS" s status exitcode rc logs latest
+  local name="$1" waited=0 budget="$SETTLE_SECS" seen_conflict=0 s status exitcode rc logs
   while [[ "$waited" -lt "$budget" ]]; do
     sleep "$POLL_SLEEP_SECS"
     waited=$((waited + SAMPLE_SECS))
@@ -317,14 +323,14 @@ verify_runner() {
       log "verified: $name registered and is listening for jobs (${waited}s, 0 restarts)"
       return 0
     fi
-    latest="${logs##*$'\n'}"
-    if [[ "$latest" == *"$CONFLICT_MARKER"* ]]; then
+    if grep -q "$CONFLICT_MARKER" <<< "$logs"; then
+      seen_conflict=1
+    fi
+    if [[ "$seen_conflict" -eq 1 ]]; then
       budget="$CONFLICT_CEILING_SECS"
-    else
-      budget="$SETTLE_SECS"
     fi
   done
-  if [[ "$latest" == *"$CONFLICT_MARKER"* ]]; then
+  if [[ "$seen_conflict" -eq 1 ]]; then
     warn "VERIFY FAILED: $name still reporting a stale GitHub session ('$CONFLICT_MARKER') after ${waited}s."
     warn "  The previous runner was not deregistered (it was killed, not stopped), so GitHub rejects the new session until the old one expires. This wait is capped at ${CONFLICT_CEILING_SECS}s."
   else
