@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — load ci-janitor as a daily launchd agent. Idempotent.
+# install.sh — load ci-janitor as an hourly launchd agent. Idempotent.
 #
 # dotbot owns the ~ symlinks (config/ci-janitor -> ~/.config/ci-janitor); this script owns
 # only the launchctl lifecycle, which dotbot can't do. Run `./install` from the dotfiles

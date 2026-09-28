@@ -8,9 +8,13 @@
      Paths are absolute by this repo's convention (single-user machine); the scripts are
      the dotbot-linked ~/.config/{periodic,ci-janitor}/.
 
-     Daily, plus RunAtLoad so a machine that was off during a scheduled window still
-     sweeps once it comes back. The script's own age floor (24h) is what keeps a sweep
-     from touching a live job, so the schedule never has to be timed around CI.
+     Hourly, plus RunAtLoad so a machine that was off during a scheduled window still
+     sweeps once it comes back. Hourly because each run first measures the Docker disk's
+     space and inodes and, at the high-water mark, sweeps at the 7h floor instead of 24h:
+     on 2026-09-28 a 13-PR day exhausted the inodes within hours, and a daily slot
+     would have met that pressure the next day, after ht-runner had already crash-looped.
+     The script's own age floor (24h, or 7h under pressure) is what keeps a sweep from
+     touching a live job, so the schedule never has to be timed around CI.
 
      WHY KeepAlive AND NOT StartInterval
      This agent used to say `StartInterval 86400`. Between its install on 2026-08-18 and
@@ -35,12 +39,13 @@
     <string>--label</string>
     <string>ci-janitor</string>
     <string>--interval</string>
-    <string>86400</string>
-    <!-- A sweep enumerates and removes; an hour is far beyond any real sweep and still
-         bounds one wedged on an unresponsive Docker socket, rather than letting it hold
-         the daily slot open forever. -->
-    <string>--timeout</string>
     <string>3600</string>
+    <!-- A sweep enumerates and removes; the 48-volume relief sweep on 2026-09-28 took
+         ~20s, so 30 minutes is far beyond any real sweep and still bounds one wedged on
+         an unresponsive Docker socket inside the hour, so the next pressure check is
+         never skipped. -->
+    <string>--timeout</string>
+    <string>1800</string>
     <string>--heartbeat</string>
     <string>/Users/hhouse/.local/share/ci-janitor/heartbeat</string>
     <string>--</string>
