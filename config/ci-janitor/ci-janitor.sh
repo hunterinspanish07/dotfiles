@@ -63,17 +63,29 @@
 # (SystemTime and CreatedAt share one clock) so Mac-vs-VM drift cannot push a live job
 # under the floor. [LAW:no-ambient-temporal-coupling]
 #
+# UNDER DISK PRESSURE THE FLOOR DROPS, NEVER THE ALLOWLIST
+# Every run measures the Docker disk BEFORE sweeping. When space or inodes are at the
+# high-water mark, that run sweeps at AGE_HOURS_MIN (7h) instead of the normal floor.
+# Only the age moves — the three positive signatures below are the same on every run, and
+# 7h is still past the 6h platform job ceiling. Inodes are measured, not just bytes,
+# because they are what actually ran out: on 2026-09-28 /var/lib/docker hit 100% of its
+# inodes at 58% of its space. Each orphaned CI volume can hold ~190k files (a venv or
+# node_modules per job), a 13-PR day left ~28 of them mostly under the 24h floor,
+# ht-runner crash-looped 204 times on ENOSPC, and a bytes-only check never fired.
+# The agent runs hourly (see com.hhouse.ci-janitor.plist), so pressure is met the same CI
+# day rather than at the next daily slot. [LAW:dataflow-not-control-flow]
+#
 # HOW YOU FIND OUT IT BROKE
 # The whole point of this script is that silent accumulation is what hurt. So it is
 # built to be loud about its own failure: every non-zero exit from a RUN both logs and
 # raises a desktop notification, and two independent checks catch the failure modes that
 # a sweep-only janitor would miss —
-#   * the post-sweep high-water check fires when the disk is STILL above threshold
-#     after a clean sweep, which is how you learn something is accumulating from a
-#     source these three sweeps don't cover;
+#   * the post-sweep high-water check fires when space or inodes are STILL at the mark
+#     after a sweep (a pressure sweep, if the run began over it), which is how you learn
+#     the disk is filling faster than the safety floor lets the janitor reclaim it;
 #   * the staleness check fires when the janitor itself hasn't run, which is how you
 #     learn the launchd agent died rather than assuming silence meant health.
-# A successful run stays quiet in the notification channel (it always logs) — daily
+# A successful run stays quiet in the notification channel (it always logs) — hourly
 # "cleaned up fine" alerts train you to ignore the channel that carries the alarms.
 # [LAW:no-silent-failure]
 #
@@ -82,8 +94,9 @@
 #   2  the janitor could not run at all (Docker/Colima unreachable) — NOT "all clean"
 #   3  the run did not fully succeed — a removal/age failed, the staleness clock could
 #      not be armed, OR the high-water check could not measure the disk (notify names which)
-#   4  swept clean, but the disk is STILL above the high-water mark — something is
-#      accumulating that these sweeps do not cover; investigate by hand
+#   4  swept, but space or inodes are STILL at or above the high-water mark (at the 7h
+#      pressure floor when the run began over it). Held as the ci-docker-disk-full alert
+#      until a run measures the disk under the mark; it names the resource and what holds it
 #   5  the janitor had not run for far longer than its schedule — it was silently dead
 #      (the stale shout also fires on exit 4 when both apply; see outcome block)
 #  64  usage error (unrecognized argument), per sysexits EX_USAGE. Deliberately the one
@@ -95,9 +108,11 @@
 set -euo pipefail
 
 # --- configuration ------------------------------------------------------------
-# Nothing younger than this is ever touched, in any sweep. See "HOW 'DON'T TOUCH A
-# LIVE JOB' IS GUARANTEED" above — this single number is that guarantee, so it has one
-# home and every sweep reads it. [LAW:one-source-of-truth]
+# Two floors, one choice per run. AGE_HOURS is the normal floor: below the high-water mark
+# nothing younger is touched. AGE_HOURS_MIN is the floor under disk pressure, and the
+# absolute one: nothing younger than it is touched in any sweep, ever. Each run picks one
+# into floor_hours (see the pressure check) and every sweep reads that single value.
+# See "HOW 'DON'T TOUCH A LIVE JOB' IS GUARANTEED" above. [LAW:one-source-of-truth]
 #
 # AGE_HOURS_MIN is the live-job safety floor made unrepresentable-to-violate: the
 # platform's own job ceiling is 6h, so anything below 7h would make sweep 1's
@@ -107,18 +122,20 @@ set -euo pipefail
 # [LAW:types-are-the-program] [LAW:no-silent-failure]
 AGE_HOURS_MIN=7
 AGE_HOURS="${CI_JANITOR_AGE_HOURS:-24}"
-# Percent-used of the Docker disk above which a post-sweep run is considered a failure
-# to keep up, not a success. 85 leaves real headroom on the 98 GB volume: the Playwright
-# install that first exposed this needs a few GB of scratch.
+# The high-water mark, applied to space AND inodes: at or above it before a sweep, the run
+# sweeps at AGE_HOURS_MIN; still at or above it after, the run exits 4. 85 leaves real
+# headroom on the 98 GB volume: the Playwright install that first exposed this needs a few
+# GB of scratch, and one leaked volume can take ~3% of the inodes.
 DISK_WARN_PCT="${CI_JANITOR_DISK_WARN_PCT:-85}"
-# Flag the janitor's own silence. The agent runs daily; 72h means two consecutive
-# missed days, past any plausible "the laptop was closed over a weekend".
+# Flag the janitor's own silence. The agent runs hourly and periodic.sh's heartbeat shows a
+# dead one at the next Claude session start; this 72h gap is the janitor's own backstop,
+# which notifies even when no session is opened, past any plausible closed-lid weekend.
 STALE_HOURS="${CI_JANITOR_STALE_HOURS:-72}"
 LOG_FILE="${CI_JANITOR_LOG:-$HOME/.local/share/ci-janitor/janitor.log}"
 STATE_FILE="${CI_JANITOR_STATE:-$HOME/.local/share/ci-janitor/last-run}"
 # The Docker disk inside the Colima VM. `docker system df` reports what Docker owns but
-# never how much room is LEFT, and free space is the quantity that actually causes
-# ENOSPC — so the high-water check has to ask the VM's filesystem directly.
+# never how much room is LEFT, and running out of room (bytes or inodes) is what actually
+# causes ENOSPC — so the pressure check has to ask the VM's filesystem directly.
 DOCKER_DISK="${CI_JANITOR_DOCKER_DISK:-/var/lib/docker}"
 
 # Read-only mode: classify and report every candidate exactly as a real run would, and
@@ -184,7 +201,7 @@ reclaimed=0       # count of objects actually removed (or that a dry run would r
 age_deferred=0    # allowlist hits younger than the floor (covered residue)
 kept_referenced=0 # aged allowlist hits kept as benign "in use" (covered residue)
 state_unarmed=0   # agent ran but the staleness clock could not be written
-disk_unmeasured=0 # agent ran but the high-water check could not read the disk
+disk_unmeasured=0 # agent ran but a pressure/high-water measurement could not read the disk
 state_unknown=0   # stamp existed but was unreadable/malformed (not a measured dead-agent gap)
 
 # --- helpers ------------------------------------------------------------------
@@ -303,6 +320,39 @@ remove_one() {
   return 0
 }
 
+# The one read of the Docker disk, before and after the sweep: space and inode percent in
+# a single df inside the VM. Sets DISK_SPACE and DISK_INODES, or returns 1 with DISK_ERR
+# saying why. An unreadable number is never read as 0% — the caller marks the run
+# unmeasured. Called directly (not via $(...)) so the three results survive the call.
+# [LAW:effects-at-boundaries] [LAW:no-silent-failure]
+read_disk() {
+  local out pcts
+  DISK_SPACE="" DISK_INODES="" DISK_ERR=""
+  if ! out=$(colima ssh -- df --output=pcent,ipcent "$DOCKER_DISK" 2>&1); then
+    DISK_ERR="colima ssh df failed: $(printf '%s' "$out" | tail -1)"
+    return 1
+  fi
+  # The value row is the one shaped "NN% NN%"; stderr is merged in for the error message,
+  # so the row is found by its shape rather than assumed to be line 2.
+  pcts=$(printf '%s\n' "$out" | awk '/^[[:space:]]*[0-9]+%[[:space:]]+[0-9]+%[[:space:]]*$/ {gsub(/%/,""); print $1, $2; exit}')
+  read -r DISK_SPACE DISK_INODES <<< "$pcts"
+  if [[ "$DISK_SPACE" =~ ^[0-9]+$ && "$DISK_INODES" =~ ^[0-9]+$ ]]; then
+    return 0
+  fi
+  DISK_ERR="unexpected df output: $(printf '%s' "$out" | tr '\n' ' ')"
+  return 1
+}
+
+# Which resources sit at or above the mark: "", "space 88%", "inodes 91%", or both joined.
+# Pure: the measurement is an input, the answer names the resource so every log line and
+# notification can say WHICH one is short. [LAW:effects-at-boundaries]
+over_mark() {
+  local list=""
+  [[ "$1" -ge "$DISK_WARN_PCT" ]] && list="space ${1}%"
+  [[ "$2" -ge "$DISK_WARN_PCT" ]] && list="${list:+$list, }inodes ${2}%"
+  printf '%s' "$list"
+}
+
 # --- preflight ----------------------------------------------------------------
 docker info >/dev/null 2>&1 || die "Docker daemon unreachable (is Colima up? 'colima start')"
 
@@ -315,7 +365,6 @@ daemon_now_raw=$(docker info --format '{{.SystemTime}}') \
 NOW_DAEMON=$(epoch_of "$daemon_now_raw") \
   || die "could not parse daemon SystemTime '$daemon_now_raw' — cannot establish the age floor"
 [[ -n "$NOW_DAEMON" ]] || die "daemon SystemTime parsed empty — cannot establish the age floor"
-CUTOFF=$(( NOW_DAEMON - AGE_HOURS * 3600 ))
 
 # Did the janitor itself stop running? Only detectable once it runs again after a gap,
 # but that is precisely the case worth catching: an agent silently unloaded for weeks
@@ -343,7 +392,27 @@ fi
 
 mode_note=""
 [[ "$DRY_RUN" -ne 0 ]] && mode_note=" [DRY RUN — nothing will be deleted]"
-log "start${mode_note}: age floor ${AGE_HOURS}h, disk high-water ${DISK_WARN_PCT}%"
+
+# --- pressure check: measure first, so this run's floor answers the disk it finds -----
+# Every run takes the same steps; pressure changes one value, the age floor. A disk that
+# cannot be measured gives no evidence of pressure, so that run keeps the normal floor and
+# is reported as unmeasured (exit 3), never as healthy. [LAW:dataflow-not-control-flow]
+pressure=""
+if read_disk; then
+  pressure=$(over_mark "$DISK_SPACE" "$DISK_INODES")
+  log "pressure check: ${DOCKER_DISK} space ${DISK_SPACE}%, inodes ${DISK_INODES}% (high-water ${DISK_WARN_PCT}%)"
+else
+  warn "pressure check could not measure ${DOCKER_DISK} (${DISK_ERR}); sweeping at the normal floor"
+  disk_unmeasured=1
+fi
+floor_hours="$AGE_HOURS"
+if [[ -n "$pressure" ]]; then
+  floor_hours="$AGE_HOURS_MIN"
+  warn "PRESSURE: ${DOCKER_DISK} at or over the ${DISK_WARN_PCT}% mark (${pressure}) — pressure sweep, age floor lowered to ${AGE_HOURS_MIN}h"
+fi
+CUTOFF=$(( NOW_DAEMON - floor_hours * 3600 ))
+
+log "start${mode_note}: age floor ${floor_hours}h, disk high-water ${DISK_WARN_PCT}%"
 
 # --- sweep 1: orphaned Actions networks, and the containers still on them ------
 # FIRST: containers pin anonymous volumes. Until they are removed, those volumes are
@@ -418,28 +487,27 @@ fi
 
 # --- post-sweep high-water check ----------------------------------------------
 # The backstop that makes the rest honest. The sweeps only reclaim what they recognise;
-# this asks the filesystem whether that was actually ENOUGH. A janitor that reports
-# success while the disk fills from a source it does not cover is the same silent lie,
-# one level up. [LAW:no-silent-failure] [LAW:verifiable-goals]
-disk_pct=""
-if df_out=$(colima ssh -- df -P "$DOCKER_DISK" 2>/dev/null); then
-  disk_pct=$(printf '%s\n' "$df_out" | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
-fi
-if [[ ! "$disk_pct" =~ ^[0-9]+$ ]]; then
+# this asks the filesystem whether that was actually ENOUGH, for bytes and inodes alike.
+# A janitor that reports success while the disk fills is the same silent lie, one level
+# up. [LAW:no-silent-failure] [LAW:verifiable-goals]
+still_over=""
+post_measured=0
+if read_disk; then
+  post_measured=1
+  still_over=$(over_mark "$DISK_SPACE" "$DISK_INODES")
+  log "after sweep: ${DOCKER_DISK} space ${DISK_SPACE}%, inodes ${DISK_INODES}% (high-water ${DISK_WARN_PCT}%)"
+else
   # Never treat an unmeasurable disk as a healthy one — and never launder this into
   # "something could not be swept". Same split as state_unarmed. [LAW:types-are-the-program]
-  warn "could not read usage of $DOCKER_DISK via colima; the high-water check did not run this cycle"
+  warn "could not measure ${DOCKER_DISK} after the sweep (${DISK_ERR}); the high-water check did not run this cycle"
   disk_unmeasured=1
-  disk_pct=""
-else
-  log "docker disk ${DOCKER_DISK} is ${disk_pct}% used (high-water ${DISK_WARN_PCT}%)"
 fi
 
 # Restamp means "the agent ran," not "the sweep was clean." Stale's unique job is
 # detecting silence (launchd unloaded, no notifies at all) while the disk refills.
 # Gating the stamp on incomplete=0 collapsed that into "no fully-clean completion":
 # a stuck volume would fire exit 3 every day *and*, after 72h, permanently false-alarm
-# "agent was down" even though the agent is healthy. Incomplete stays the daily
+# "agent was down" even though the agent is healthy. Incomplete stays the per-run
 # partial-sweep signal; the clock only answers "did the agent show up." A dry run is a
 # rehearsal and must not reset the clock. [LAW:one-source-of-truth]
 #
@@ -473,20 +541,22 @@ fi
 # alarm; only the exit code is a single winner. [LAW:no-silent-failure]
 log "done${mode_note}: ${reclaimed} object(s) $([[ "$DRY_RUN" -ne 0 ]] && echo 'would be removed' || echo 'removed')${age_deferred:+; ${age_deferred} under age floor}"
 
-# Disk pressure and "outside source" are two facts. Exit 4 is only the outside
-# diagnosis (eligible set empty, residue must be something we don't cover). Covered
-# residue (young skips + benign in-use keeps) must still SHOUT about the pressure —
-# silence while the disk is full of reclaimable CI garbage is the original harm —
-# but must not claim an uncovered source. [LAW:types-are-the-program] [LAW:no-silent-failure]
-high_water=0          # exit 4: outside source
-disk_pressure_covered=0  # notify only: disk high, covered residue remains
+# Still over the mark after the sweep is ONE fact (exit 4). What holds the disk is one of
+# three things, and the alert says which: the sweep did not finish (a removal failed, so
+# nothing is established — ENOSPC while unlinking a 190k-file volume is exactly this
+# incident), CI objects the floor protects (younger than it, or in use), or nothing
+# eligible is left and a source these sweeps do not cover is filling it. All need a human
+# before a runner hits ENOSPC: the run has already swept at the lowest floor that is safe
+# for live jobs. [LAW:types-are-the-program] [LAW:no-silent-failure]
+high_water=0
 covered_residue=$(( age_deferred + kept_referenced ))
-if [[ "$DRY_RUN" -eq 0 && "$incomplete" -eq 0 && -n "$disk_pct" && "$disk_pct" -ge "$DISK_WARN_PCT" ]]; then
-  if [[ "$covered_residue" -gt 0 ]]; then
-    disk_pressure_covered=1
-  else
-    high_water=1
-  fi
+[[ "$DRY_RUN" -eq 0 && -n "$still_over" ]] && high_water=1
+if [[ "$incomplete" -ne 0 ]]; then
+  holder="the sweep did not finish (see INCOMPLETE in the log), so what is holding the disk is not established"
+elif [[ "$covered_residue" -gt 0 ]]; then
+  holder="${covered_residue} CI object(s) are still under the ${floor_hours}h floor or in use (${age_deferred} too young, ${kept_referenced} in use); the floor protects live jobs, so they cannot be swept yet"
+else
+  holder="every eligible object was removed, so something outside these sweeps is filling it. Inspect with: docker system df -v"
 fi
 
 if [[ "$was_stale" -ne 0 && "$DRY_RUN" -eq 0 ]]; then
@@ -515,16 +585,27 @@ if [[ "$state_unarmed" -ne 0 ]]; then
   notify "CI janitor could not arm its staleness clock. See ${LOG_FILE}."
 fi
 if [[ "$disk_unmeasured" -ne 0 ]]; then
-  warn "DISK UNMEASURED: could not read usage of $DOCKER_DISK — high-water check did not run this cycle"
-  notify "CI janitor could not measure the Docker disk — high-water check skipped. See ${LOG_FILE}."
+  warn "DISK UNMEASURED: could not read space/inodes of $DOCKER_DISK — the pressure check (before) or high-water check (after) did not run this cycle"
+  notify "CI janitor could not measure the Docker disk — pressure or high-water check skipped. See ${LOG_FILE}."
 fi
-if [[ "$disk_pressure_covered" -ne 0 ]]; then
-  warn "DISK PRESSURE: ${DOCKER_DISK} at ${disk_pct}% with ${covered_residue} covered CI object(s) still present (${age_deferred} under age floor, ${kept_referenced} in use) — not an outside source; they will age in or free when unreferenced"
-  notify "CI janitor: disk at ${disk_pct}% — covered CI garbage still present (aging in / in use), not an outside source. See ${LOG_FILE}."
-fi
+# A full disk is a CONDITION, not an event: it stays true across hourly runs until the
+# disk recovers. So it is raised as a held alert — shown at the top of every Claude Code
+# session by the ops-alerts hook, re-bannered on the notifier's reminder interval rather
+# than every hour — and cleared by the first run whose post-sweep reading is under the
+# mark. A dry run or an unmeasured disk proves nothing about the disk, so it leaves the
+# condition as it was. If the condition cannot be recorded, the alarm still goes out as a
+# one-shot banner. [LAW:types-are-the-program] [LAW:no-silent-failure]
+DISK_ALERT_ID="ci-docker-disk-full"
 if [[ "$high_water" -ne 0 ]]; then
-  warn "HIGH WATER: ${DOCKER_DISK} still ${disk_pct}% used after reclaiming every eligible object — something outside these sweeps is filling it. Inspect with: docker system df -v"
-  notify "CI janitor: disk still ${disk_pct}% after cleaning — something else is filling it. See ${LOG_FILE}."
+  warn "HIGH WATER: ${DOCKER_DISK} still at or over ${DISK_WARN_PCT}% after a ${floor_hours}h-floor sweep (${still_over}) — ${holder}"
+  disk_msg="Docker disk still full after a ${floor_hours}h-floor sweep (${still_over}); runners may hit ENOSPC. ${holder}. Log: ${LOG_FILE}"
+  "$ALERTS" raise "$DISK_ALERT_ID" "CI DOCKER DISK FULL" "$disk_msg" || {
+    warn "note: could not hold alert $DISK_ALERT_ID through $ALERTS; sending a one-shot banner instead"
+    notify "$disk_msg"
+  }
+elif [[ "$DRY_RUN" -eq 0 && "$post_measured" -eq 1 ]]; then
+  "$ALERTS" clear "$DISK_ALERT_ID" \
+    || warn "note: could not clear alert $DISK_ALERT_ID through $ALERTS; a stale DISK FULL may still show"
 fi
 
 # Exit precedence, most-severe first. Notifies already fired above.
