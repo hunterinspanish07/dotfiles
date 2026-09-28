@@ -28,7 +28,8 @@ lacks() { if grep -qF -- "$3" "$2" 2>/dev/null; then no "$1 ('$3' found in $(bas
 # --- stubs --------------------------------------------------------------------
 # $STUB/volumes: "<name> <CreatedAt>" per dangling volume. $STUB/df: "<space> <inodes>".
 # $STUB/df-after, if present, replaces $STUB/df on the first volume removal (the sweep
-# freed the disk). $STUB/df-fail makes the VM df fail. Removals are logged to $STUB/removed.
+# freed the disk). $STUB/df-fail makes the VM df fail; $STUB/rm-fail makes every volume
+# removal fail with ENOSPC. Removals are logged to $STUB/removed.
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -40,6 +41,7 @@ case "$1 ${2:-}" in
   "volume ls")      awk '{print $1}' "$STUB/volumes" ;;
   "volume inspect") awk -v n="$3" '$1 == n {print $2}' "$STUB/volumes" ;;
   "volume rm")
+    [[ -f "$STUB/rm-fail" ]] && { echo "Error response from daemon: remove $3: unlinkat: no space left on device" >&2; exit 1; }
     echo "$3" >> "$STUB/removed"
     grep -v "^$3 " "$STUB/volumes" > "$STUB/volumes.tmp"; mv "$STUB/volumes.tmp" "$STUB/volumes"
     [[ -f "$STUB/df-after" ]] && mv "$STUB/df-after" "$STUB/df"
@@ -117,6 +119,27 @@ check "exit 4" "$rc" "4"
 has "banner names inodes" "$STUB/banners" "inodes 91%"
 has "banner says young CI objects are what the floor protects" "$STUB/banners" "under the 7h floor"
 lacks "banner does not blame an outside source while CI residue remains" "$STUB/banners" "outside these sweeps"
+
+ALERT="ci-docker-disk-full"
+has "the full disk is held as an active alert naming inodes" "$STUB/alerts/active/$ALERT/message" "inodes 91%"
+run_janitor; rc=$?
+check "a second still-full run exits 4 again" "$rc" "4"
+check "but banners only once while the condition holds" "$(grep -c 'CI DOCKER DISK FULL' "$STUB/banners")" "1"
+touch "$STUB/df-fail"
+run_janitor
+if [[ -d "$STUB/alerts/active/$ALERT" ]]; then ok "an unmeasured run leaves the alert held"; else no "an unmeasured run cleared the alert"; fi
+rm -f "$STUB/df-fail"; echo "58 40" > "$STUB/df"
+run_janitor; rc=$?
+check "the first run measured under the mark exits 0" "$rc" "0"
+if [[ -d "$STUB/alerts/active/$ALERT" ]]; then no "recovery did not clear the alert"; else ok "recovery clears the alert"; fi
+
+echo "a sweep that could not finish never claims to know what holds the disk"
+fresh_case "58 91" "${all_volumes[@]}"; touch "$STUB/rm-fail"
+run_janitor; rc=$?
+check "exit 3 (incomplete outranks 4)" "$rc" "3"
+has "the alert says the sweep did not finish" "$STUB/alerts/active/$ALERT/message" "the sweep did not finish"
+lacks "the alert does not blame an outside source" "$STUB/alerts/active/$ALERT/message" "outside these sweeps"
+lacks "the alert does not claim young objects are the holder" "$STUB/alerts/active/$ALERT/message" "cannot be swept yet"
 
 echo "space alone over the mark is named as space"
 fresh_case "90 40" "${all_volumes[@]}"

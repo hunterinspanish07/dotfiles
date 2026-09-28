@@ -65,8 +65,9 @@ actively-used repo's checkout never ages out anyway).
 ## How live jobs are protected
 
 Not by polling for running jobs and not by a settle-sleep — both are races. The **age
-floor is the guarantee**: nothing younger than `CI_JANITOR_AGE_HOURS` (default 24h) is
-ever touched, in any sweep. Jobs on this host take 1–2 minutes and the platform ceiling
+floor is the guarantee**: below the high-water mark nothing younger than
+`CI_JANITOR_AGE_HOURS` (default 24h) is touched, and under disk pressure (next section)
+nothing younger than 7h is touched, in any sweep. Jobs on this host take 1–2 minutes and the platform ceiling
 is 6 hours, so nothing the janitor can see could belong to a job still running.
 
 The floor is enforced, not just documented: values below **7h** (platform ceiling + 1h
@@ -98,9 +99,12 @@ terminal, where stderr is already on screen). Two checks catch what a sweep-only
 janitor would miss:
 
 - **High-water check** — fires when space or inodes are *still* at the mark after the
-  sweep, at the 7h floor if the run began over it. The notification names the resource
-  and what is holding it: CI objects too young to sweep safely, or a source these sweeps
-  don't cover.
+  sweep, at the 7h floor if the run began over it. A full disk stays full across hourly
+  runs, so it is a **held alert** (`ci-docker-disk-full` through `../alerts`), not a
+  banner per run. It shows at the top of every Claude Code session and re-banners every
+  6h, and the first run that measures the disk under the mark clears it. The alert names
+  the resource and what is holding it: a sweep that did not finish, CI objects too young
+  to sweep safely, or a source these sweeps don't cover.
 - **Staleness check** — fires when the janitor itself hasn't run in over 72h. This is how
   you learn the launchd agent died, instead of reading its silence as health.
 
@@ -114,7 +118,7 @@ A successful run stays quiet in the notification channel (it always logs). Hourl
 | 0 | Ran clean — swept what was there, disk healthy |
 | 2 | Could not run at all (Docker/Colima unreachable). **Not** "all clean" |
 | 3 | Run did not fully succeed — removal/age failed, staleness clock unarmed, **or** Docker disk unmeasurable (notify names which) |
-| 4 | Swept, but space or inodes are **still** at the high-water mark (at the 7h pressure floor when the run began over it). The notification names the resource and whether young CI objects or an outside source is holding it |
+| 4 | Swept, but space or inodes are **still** at the high-water mark (at the 7h pressure floor when the run began over it). Held as the `ci-docker-disk-full` alert, naming the resource and what is holding it |
 | 5 | Hadn't run for far longer than its schedule — it was silently dead (stale is also notified on exit 4 when both fire) |
 | 64 | Usage error (unrecognized argument) — the one non-zero exit that deliberately does **not** notify: you can only reach it by mistyping the command at a terminal, where the stderr line is already in front of you |
 
@@ -151,7 +155,7 @@ All optional; the defaults are the tested ones.
 
 | Variable | Default | What it controls |
 |---|---|---|
-| `CI_JANITOR_AGE_HOURS` | `24` | Age floor. Nothing younger is touched, ever. **Minimum 7** (refused below that) |
+| `CI_JANITOR_AGE_HOURS` | `24` | Normal age floor: below the high-water mark nothing younger is touched. At the mark the run sweeps at 7h instead, and nothing younger than 7h is ever touched. **Minimum 7** (refused below that) |
 | `CI_JANITOR_DISK_WARN_PCT` | `85` | High-water mark for space and inodes: at or above it before a sweep, the run sweeps at 7h; still at it after, exit 4. **Integer 1–99** (refused outside) |
 | `CI_JANITOR_STALE_HOURS` | `72` | How long silence means the agent died. **Positive integer** (refused otherwise) |
 | `CI_JANITOR_LOG` | `~/.local/share/ci-janitor/janitor.log` | Log path |

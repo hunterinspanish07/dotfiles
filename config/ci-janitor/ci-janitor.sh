@@ -95,8 +95,8 @@
 #   3  the run did not fully succeed — a removal/age failed, the staleness clock could
 #      not be armed, OR the high-water check could not measure the disk (notify names which)
 #   4  swept, but space or inodes are STILL at or above the high-water mark (at the 7h
-#      pressure floor when the run began over it). The notification names the resource and
-#      whether young CI objects or a source these sweeps do not cover is holding it
+#      pressure floor when the run began over it). Held as the ci-docker-disk-full alert
+#      until a run measures the disk under the mark; it names the resource and what holds it
 #   5  the janitor had not run for far longer than its schedule — it was silently dead
 #      (the stale shout also fires on exit 4 when both apply; see outcome block)
 #  64  usage error (unrecognized argument), per sysexits EX_USAGE. Deliberately the one
@@ -108,9 +108,11 @@
 set -euo pipefail
 
 # --- configuration ------------------------------------------------------------
-# Nothing younger than this is ever touched, in any sweep. See "HOW 'DON'T TOUCH A
-# LIVE JOB' IS GUARANTEED" above — this single number is that guarantee, so it has one
-# home and every sweep reads it. [LAW:one-source-of-truth]
+# Two floors, one choice per run. AGE_HOURS is the normal floor: below the high-water mark
+# nothing younger is touched. AGE_HOURS_MIN is the floor under disk pressure, and the
+# absolute one: nothing younger than it is touched in any sweep, ever. Each run picks one
+# into floor_hours (see the pressure check) and every sweep reads that single value.
+# See "HOW 'DON'T TOUCH A LIVE JOB' IS GUARANTEED" above. [LAW:one-source-of-truth]
 #
 # AGE_HOURS_MIN is the live-job safety floor made unrepresentable-to-violate: the
 # platform's own job ceiling is 6h, so anything below 7h would make sweep 1's
@@ -489,7 +491,9 @@ fi
 # A janitor that reports success while the disk fills is the same silent lie, one level
 # up. [LAW:no-silent-failure] [LAW:verifiable-goals]
 still_over=""
+post_measured=0
 if read_disk; then
+  post_measured=1
   still_over=$(over_mark "$DISK_SPACE" "$DISK_INODES")
   log "after sweep: ${DOCKER_DISK} space ${DISK_SPACE}%, inodes ${DISK_INODES}% (high-water ${DISK_WARN_PCT}%)"
 else
@@ -537,16 +541,19 @@ fi
 # alarm; only the exit code is a single winner. [LAW:no-silent-failure]
 log "done${mode_note}: ${reclaimed} object(s) $([[ "$DRY_RUN" -ne 0 ]] && echo 'would be removed' || echo 'removed')${age_deferred:+; ${age_deferred} under age floor}"
 
-# Still over the mark after the sweep is ONE fact (exit 4) with two possible causes, and
-# the notification carries which: CI objects the floor protects (younger than it, or in
-# use) are holding the disk, or nothing eligible is left and a source these sweeps do not
-# cover is filling it. Both need a human before a runner hits ENOSPC — by the time this
-# fires the run has already swept at the lowest floor that is safe for live jobs.
-# [LAW:types-are-the-program] [LAW:no-silent-failure]
+# Still over the mark after the sweep is ONE fact (exit 4). What holds the disk is one of
+# three things, and the alert says which: the sweep did not finish (a removal failed, so
+# nothing is established — ENOSPC while unlinking a 190k-file volume is exactly this
+# incident), CI objects the floor protects (younger than it, or in use), or nothing
+# eligible is left and a source these sweeps do not cover is filling it. All need a human
+# before a runner hits ENOSPC: the run has already swept at the lowest floor that is safe
+# for live jobs. [LAW:types-are-the-program] [LAW:no-silent-failure]
 high_water=0
 covered_residue=$(( age_deferred + kept_referenced ))
 [[ "$DRY_RUN" -eq 0 && -n "$still_over" ]] && high_water=1
-if [[ "$covered_residue" -gt 0 ]]; then
+if [[ "$incomplete" -ne 0 ]]; then
+  holder="the sweep did not finish (see INCOMPLETE in the log), so what is holding the disk is not established"
+elif [[ "$covered_residue" -gt 0 ]]; then
   holder="${covered_residue} CI object(s) are still under the ${floor_hours}h floor or in use (${age_deferred} too young, ${kept_referenced} in use); the floor protects live jobs, so they cannot be swept yet"
 else
   holder="every eligible object was removed, so something outside these sweeps is filling it. Inspect with: docker system df -v"
@@ -581,9 +588,24 @@ if [[ "$disk_unmeasured" -ne 0 ]]; then
   warn "DISK UNMEASURED: could not read space/inodes of $DOCKER_DISK — the pressure check (before) or high-water check (after) did not run this cycle"
   notify "CI janitor could not measure the Docker disk — pressure or high-water check skipped. See ${LOG_FILE}."
 fi
+# A full disk is a CONDITION, not an event: it stays true across hourly runs until the
+# disk recovers. So it is raised as a held alert — shown at the top of every Claude Code
+# session by the ops-alerts hook, re-bannered on the notifier's reminder interval rather
+# than every hour — and cleared by the first run whose post-sweep reading is under the
+# mark. A dry run or an unmeasured disk proves nothing about the disk, so it leaves the
+# condition as it was. If the condition cannot be recorded, the alarm still goes out as a
+# one-shot banner. [LAW:types-are-the-program] [LAW:no-silent-failure]
+DISK_ALERT_ID="ci-docker-disk-full"
 if [[ "$high_water" -ne 0 ]]; then
   warn "HIGH WATER: ${DOCKER_DISK} still at or over ${DISK_WARN_PCT}% after a ${floor_hours}h-floor sweep (${still_over}) — ${holder}"
-  notify "CI janitor: Docker disk still full after sweeping (${still_over}) — runners may hit ENOSPC. ${holder}. See ${LOG_FILE}."
+  disk_msg="Docker disk still full after a ${floor_hours}h-floor sweep (${still_over}); runners may hit ENOSPC. ${holder}. Log: ${LOG_FILE}"
+  "$ALERTS" raise "$DISK_ALERT_ID" "CI DOCKER DISK FULL" "$disk_msg" || {
+    warn "note: could not hold alert $DISK_ALERT_ID through $ALERTS; sending a one-shot banner instead"
+    notify "$disk_msg"
+  }
+elif [[ "$DRY_RUN" -eq 0 && "$post_measured" -eq 1 ]]; then
+  "$ALERTS" clear "$DISK_ALERT_ID" \
+    || warn "note: could not clear alert $DISK_ALERT_ID through $ALERTS; a stale DISK FULL may still show"
 fi
 
 # Exit precedence, most-severe first. Notifies already fired above.
