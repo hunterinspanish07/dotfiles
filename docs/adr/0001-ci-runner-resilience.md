@@ -20,7 +20,7 @@ far stands like this today:
 |---|---|---|---|
 | Crash loop (exit ≠ 0, restarting) | 2026-09-04: self-update wreck on all three runners (817, 1,974 and 3,741 restarts) | Yes. The guard's two-sample check marks it rogue within one cycle | Yes when the cause is the container. The guard recreates from the fleet spec, once per 6h |
 | Crash loop while the disk is full | 2026-09-28: inode exhaustion, ht-runner exit 134 | Yes. ROGUE at 09:25 and `runner-fleet-down` raised | **No.** The heal runs `docker pull` to resolve a digest, and the pull needs the disk that had run out. The fallback park failed on ENOSPC too, so restart policy stayed `always`. A human ran `runner-fleet.sh up` |
-| Parked runner after its cause clears | 2026-09-06: all three runners circuit-broken after the host lost DNS; down four days | Yes, since 2026-09-26: `runner-fleet-down` is held and shown at every session start | **No.** The park latches (`restart=no`) and only a human `up` clears it, even when the cause is long gone |
+| Parked runner (the circuit breaker latched) | 2026-09-06/07: all three runners crash-looped (exit 1). Each heal's `docker pull` failed because Colima's DNS could not resolve the Docker registry, so the guard parked them. They stayed down four days | Yes, since 2026-09-26: `runner-fleet-down` is held and shown at every session start | **No.** The park latches (`restart=no`) and only a human `up` clears it |
 | Online but deaf (container running, not polling GitHub) | 2026-07-25: odyssey-runner lost DNS to the broker; ~10 queued runs went stale | **No.** The guard treats `status == running` as healthy | No |
 | Docker unreachable (VM wedged or stopped) | Colima wedge, all runners down at once | **No alarm.** The guard exits 2, `periodic.sh` records `exit=2` in the heartbeat, and the session hook checks only whether the heartbeat is fresh, not its exit code | No, and it should not be automatic: `colima restart` kills every container on the VM (Grounded's Supabase, buildx builders, all runners) |
 
@@ -47,8 +47,11 @@ gaps above inside it:
 3. **A heal restores; it does not upgrade.** A heal recreates the runner from the
    runner image already on the host and needs no registry or free disk for a pull.
    Pulling a new image stays an explicit refresh (`up --force` by an operator).
-   Restoring and upgrading are different intents and today share one code path, and
-   the shared path failed today.
+   Restoring and upgrading are different intents and today share one code path. That
+   path failed at the pull in both recorded heal attempts: on 2026-09-06/07 the
+   registry lookup failed, and on 2026-09-28 the disk was full. Both times the image
+   the failing container ran was still on the host, since a container keeps its image
+   from being removed.
 4. **The breaker gets a half-open state.** A runner the guard itself parked gets a
    bounded automatic trial recreate on a backoff. It returns by itself once the cause
    clears (disk freed, DNS back, token fixed). A runner stopped by an operator is never
