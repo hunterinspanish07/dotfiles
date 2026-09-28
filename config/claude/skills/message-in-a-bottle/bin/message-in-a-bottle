@@ -23,6 +23,7 @@ BOTTLE_DELAY_SECONDS="${BOTTLE_DELAY_SECONDS:-10}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-1}"
 IDLE_WAIT_SECONDS="${IDLE_WAIT_SECONDS:-20}"      # max wait for idle before reset
 VERIFY_TIMEOUT_SECONDS="${VERIFY_TIMEOUT_SECONDS:-20}" # max wait for reset banner
+BUSY_LOG_SECONDS="${BUSY_LOG_SECONDS:-300}"       # progress-log cadence while busy
 
 # [LAW:no-silent-failure] non-positive poll interval makes the wait counters
 # stall at 0 forever (bash integer math). Reject at the boundary once.
@@ -37,6 +38,9 @@ case "$IDLE_WAIT_SECONDS" in
 esac
 case "$VERIFY_TIMEOUT_SECONDS" in
   ''|*[!0-9]*) echo "VERIFY_TIMEOUT_SECONDS must be a non-negative integer (got: ${VERIFY_TIMEOUT_SECONDS})" >&2; exit 2 ;;
+esac
+case "$BUSY_LOG_SECONDS" in
+  ''|*[!0-9]*|0) echo "BUSY_LOG_SECONDS must be a positive integer (got: ${BUSY_LOG_SECONDS})" >&2; exit 2 ;;
 esac
 
 # [LAW:one-source-of-truth] the static framing wrapped around the agent's message
@@ -211,11 +215,18 @@ case "$MODE" in
     # [LAW:types-are-the-program] busy is harness-gated live chrome only.
     # OpenCode's status line is "esc interrupt" + token stats — bare
     # "esc interrupt" fits in transcript/source and is not proof.
+    # Claude's spinner line sits at column 0 — "✢ Determining… (14s · ",
+    # "(1m 15s · " past a minute, multi-word verbs like "Compacting
+    # conversation…" — while transcript text is indented, so a line-anchored
+    # match cannot fire on an echoed "(20s ". The glyph is matched as
+    # non-space bytes so the regex holds in a C locale too.
+    NL=$'\n'
+    CLAUDE_BUSY_RE="(^|${NL})[^[:space:]]+ [^${NL}]*… \\(([0-9]+[hm] )*[0-9]+s · "
     pane_busy() {
       local pane
       pane=$(pane_text)
       case "$HARNESS" in
-        claude)   text_re "$pane" '\([0-9]+s ' ;;
+        claude)   text_re "$pane" "$CLAUDE_BUSY_RE" ;;
         # Status line only: "esc interrupt" then token stats OR "tab agents"
         # (splash-busy has no K% yet). Bare phrase in prose does not match.
         opencode) text_re "$pane" 'esc interrupt[[:space:]]+(tab agents|[0-9]+([.][0-9]+)?K)' ;;
@@ -254,10 +265,14 @@ case "$MODE" in
     # halted the chain on every misfire. MSGFILE outlives the worker as the
     # handoff's one copy — the reader is either the live session that wrote it
     # or a fresh one that never saw it. [LAW:one-source-of-truth]
-    # Caller must ensure the composer does not hold undelivered content —
-    # this only types the note. [LAW:single-enforcer]
+    # C-u first: a /$RESET typed into a busy pane can still sit unsent in
+    # the composer, and Enter would submit "/$RESET <note>", losing the note.
+    # Paste deposits are the caller's to drain (observed) before calling.
+    # [LAW:single-enforcer]
     tell_misfire() {
       trap - EXIT
+      tmux send-keys -t "$TARGET" C-u
+      sleep 0.3
       tmux send-keys -t "$TARGET" -l "message-in-a-bottle misfired ($1). Do not stop and do not ask the user: read the handoff message in $MSGFILE and carry it out now."
       sleep 0.5
       tmux send-keys -t "$TARGET" Enter
@@ -315,13 +330,21 @@ case "$MODE" in
     # [LAW:no-ambient-temporal-coupling] idle is the owned state before the
     # reset is judged or anything is typed: a reset typed into a busy pane runs
     # only once the agent goes idle, and /compact shows its marker while still
-    # running. Unbounded on purpose — a bound here only converts "not yet" into
-    # a false misfire. The worker is detached; kill it to cancel.
+    # running. Unbounded on purpose: nothing is ever typed into a busy pane
+    # (measured live: a note queued behind a pending /clear is dropped when
+    # the clear runs), and giving up would strand a reset that is still queued.
+    # Busy is the column-0 spinner only, so this waits on a live turn, not on
+    # transcript text. Progress is logged every BUSY_LOG_SECONDS so a long wait
+    # is never silent. The worker is detached; kill it to cancel.
+    # [LAW:no-silent-failure]
     busy_waited=0
     await_idle() {
       while pane_busy; do
         sleep "$POLL_INTERVAL_SECONDS"
         busy_waited=$((busy_waited + POLL_INTERVAL_SECONDS))
+        if [ $((busy_waited % BUSY_LOG_SECONDS)) -eq 0 ]; then
+          log "still busy after ${busy_waited}s; waiting for idle"
+        fi
       done
     }
     # [LAW:dataflow-not-control-flow] the same four waits run every time; each
@@ -331,11 +354,15 @@ case "$MODE" in
     await_idle
     await_reset
     await_idle
-    log "reset check after ${verify_waited}s (idle wait ${busy_waited}s)"
+    # [LAW:types-are-the-program] the waits above leave the pane idle, so
+    # the only open question is whether the reset registered: ready (paste)
+    # or not_reset (note). No keystroke below ever lands on a busy pane.
+    if pane_reset; then PANE_STATE=ready
+    else                PANE_STATE=not_reset
+    fi
+    log "reset check after ${verify_waited}s (idle wait ${busy_waited}s): $PANE_STATE"
 
-    # [LAW:types-are-the-program] paste is reachable only after the reset
-    # registered AND the pane is idle — both established above.
-    if pane_reset; then
+    if [ "$PANE_STATE" = ready ]; then
       # [LAW:types-are-the-program] bracketed paste keeps newlines (body may
       # collapse to a chip). Enter requires a paste-only delta (not keystrokes):
       # novel PREFIX (absent before this paste), chip multiset increase, or the
