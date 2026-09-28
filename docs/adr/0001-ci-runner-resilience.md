@@ -18,8 +18,9 @@ far stands like this today:
 
 | Mode | Seen | Detected today? | Recovered today? |
 |---|---|---|---|
-| Crash loop (exit ≠ 0, restarting) | 2026-09-04: self-update wreck, 3,203 restarts | Yes. The guard's two-sample check marks it rogue within one cycle | Yes when the cause is the container. The guard recreates from the fleet spec, once per 6h |
-| Crash loop while the disk is full | 2026-09-28: inode exhaustion, ht-runner exit 134 | Yes. ROGUE at 09:25 and `runner-fleet-down` raised | **No.** The heal runs `docker pull` to resolve a digest, and the pull needs the disk that had run out. The fallback park also failed on ENOSPC. Once parked, a runner stays down until a human runs `up`, even after the cause clears |
+| Crash loop (exit ≠ 0, restarting) | 2026-09-04: self-update wreck on all three runners (817, 1,974 and 3,741 restarts) | Yes. The guard's two-sample check marks it rogue within one cycle | Yes when the cause is the container. The guard recreates from the fleet spec, once per 6h |
+| Crash loop while the disk is full | 2026-09-28: inode exhaustion, ht-runner exit 134 | Yes. ROGUE at 09:25 and `runner-fleet-down` raised | **No.** The heal runs `docker pull` to resolve a digest, and the pull needs the disk that had run out. The fallback park failed on ENOSPC too, so restart policy stayed `always`. A human ran `runner-fleet.sh up` |
+| Parked runner after its cause clears | 2026-09-06: all three runners circuit-broken after the host lost DNS; down four days | Yes, since 2026-09-26: `runner-fleet-down` is held and shown at every session start | **No.** The park latches (`restart=no`) and only a human `up` clears it, even when the cause is long gone |
 | Online but deaf (container running, not polling GitHub) | 2026-07-25: odyssey-runner lost DNS to the broker; ~10 queued runs went stale | **No.** The guard treats `status == running` as healthy | No |
 | Docker unreachable (VM wedged or stopped) | Colima wedge, all runners down at once | **No alarm.** The guard exits 2, `periodic.sh` records `exit=2` in the heartbeat, and the session hook checks only whether the heartbeat is fresh, not its exit code | No, and it should not be automatic: `colima restart` kills every container on the VM (Grounded's Supabase, buildx builders, all runners) |
 
