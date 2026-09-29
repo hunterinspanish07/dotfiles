@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -112,6 +113,11 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except RuntimeError as e:
+    # [LAW:no-silent-failure] gh failures carry their reason in stderr, which
+    # CalledProcessError.__str__ drops — print it, the way local_review.cli_main does.
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: {(e.stderr or '').strip() or e}", file=sys.stderr)
+        sys.exit(1)
+    except (RuntimeError, ValueError) as e:  # JSONDecodeError is a ValueError
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)

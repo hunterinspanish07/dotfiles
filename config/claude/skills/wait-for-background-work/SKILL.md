@@ -70,7 +70,7 @@ and believed it had complied.
 |---|---|
 | To know when it's done | Nothing. End the turn or do unrelated work. You will be re-invoked. |
 | To watch it while it streams | `Monitor` |
-| Its output, after the notification | `TaskOutput` |
+| Its output, after the notification | `Read` on the output path the notification names |
 | Exactly one mid-flight glance | One `Read` on the stated path |
 | To stop it | `TaskStop` |
 
@@ -157,5 +157,6 @@ the times it feels obviously unnecessary. Especially then.
 - The rule is the **worker**, not the filename — `.output`, scratchpad, tee'd log, all the same.
 - Never make a worker print a sentinel so you can `grep -q` for it. That is a notification you
   rebuilt by hand, and it hangs on crash.
-- `Monitor` to watch, `TaskOutput` to collect, one `Read` to glance, `TaskStop` to kill.
+- `Monitor` to watch, `Read` the named path once notified to collect, one `Read` to glance, `TaskStop`
+  to kill.
 - External state — CI, deploys, health endpoints — is **exempt**, and polling it is the job.
