@@ -224,10 +224,16 @@ keep_local_image() {
 # put the heal back on the path that failed. [LAW:no-silent-failure]
 IMAGE_DIGEST=""
 resolve_image() {
-  local out
-  out=$(docker image inspect --format='{{index .RepoDigests 0}}' "$IMAGE_SPEC" 2>&1) \
-    || die "runner image $IMAGE_SPEC is not on this host ($(tr -s '[:space:]' ' ' <<< "$out" | sed 's/^ //; s/ $//')). up restores from the local image and never pulls; fetch it with: $0 refresh"
-  IMAGE_DIGEST="$out"
+  # stdout is the digest; stderr is diagnostics, kept apart so a notice on a successful
+  # inspect cannot become part of the value, and read back only to explain a failure.
+  # [LAW:effects-at-boundaries]
+  local errf
+  errf=$(mktemp) || die "could not create a temp file for docker's stderr"
+  if ! IMAGE_DIGEST=$(docker image inspect --format='{{index .RepoDigests 0}}' "$IMAGE_SPEC" 2>"$errf"); then
+    local err; err=$(tr -s '[:space:]' ' ' < "$errf" | sed 's/^ //; s/ $//'); rm -f "$errf"
+    die "runner image $IMAGE_SPEC is not on this host ($err). up restores from the local image and never pulls; fetch it with: $0 refresh"
+  fi
+  rm -f "$errf"
   # Validate the shape before it flows downstream. An external command's output is an
   # assertion about the world until something checks it; unchecked, a malformed value
   # surfaces as `docker: invalid reference format` one call later, with the actual
@@ -429,7 +435,9 @@ cmd_up() {
   # cause. Refuse before any pull, stop, or create. [LAW:no-silent-failure]
   [[ "$CONFLICT_CEILING_SECS" -gt "$SETTLE_SECS" ]] \
     || die "RUNNER_FLEET_CONFLICT_CEILING ($CONFLICT_CEILING_SECS) must be above the settle window ($SETTLE_SECS)"
-  [[ "${1:-}" == "--force" ]] && { force=1; shift; }
+  # refresh passes --force itself, so `refresh --force` arrives with two. Each says the
+  # same thing; none of them is a runner name. [LAW:types-are-the-program]
+  while [[ "${1:-}" == "--force" ]]; do force=1; shift; done
   select_runners "$@"
   classify_selected
   local i st image failed=0 acted=0 n=0

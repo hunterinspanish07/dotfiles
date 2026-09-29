@@ -51,6 +51,8 @@ case "$1" in
   image)
     [[ "$2" == inspect ]] || { echo "stub docker: unexpected $*" >&2; exit 1; }
     [[ -f "$STUB/no_image" ]] && { echo "Error response from daemon: No such image: ${*: -1}" >&2; exit 1; }
+    # A successful inspect may still talk on stderr (a config or credential-helper notice).
+    [[ -f "$STUB/inspect_warns" ]] && echo "WARNING: Error loading config file: ~/.docker/config.json: permission denied" >&2
     echo "myoung34/github-runner@sha256:deadbeef" ;;
   run) printf '%s\n' "$*" > "$STUB/run_args"; touch "$STUB/created"; exit 0 ;;
   inspect)
@@ -102,7 +104,7 @@ exit 0
 EOF
 chmod +x "$TMP/bin/docker" "$TMP/bin/colima"
 
-reset_stub() { rm -f "$TMP/stub/created" "$TMP/stub/log_calls" "$TMP/stub/pulls" "$TMP/stub/run_args" "$TMP/stub/pull_fails" "$TMP/stub/no_image"; }
+reset_stub() { rm -f "$TMP/stub/created" "$TMP/stub/log_calls" "$TMP/stub/pulls" "$TMP/stub/run_args" "$TMP/stub/pull_fails" "$TMP/stub/no_image" "$TMP/stub/inspect_warns"; }
 # fleet <phase> <args...>: one runner-fleet invocation against the stub.
 fleet() {
   printf '%s\n' "$1" > "$TMP/stub/phase"; shift
@@ -180,6 +182,16 @@ else
   no "the runner is created from that digest with --pull=never (run: ${args:-none})"
 fi
 
+reset_stub; touch "$TMP/stub/pull_fails" "$TMP/stub/inspect_warns"
+fleet recover up --force stub-runner
+rc=$?
+out=$(cat "$TMP/up.out")
+if [[ "$rc" -eq 0 ]] && grep -q 'image resolved: myoung34/github-runner@sha256:deadbeef$' <<< "$out"; then
+  ok "a stderr notice from a successful inspect does not corrupt the digest"
+else
+  no "a stderr notice from a successful inspect does not corrupt the digest (rc=$rc) $out"
+fi
+
 reset_stub; touch "$TMP/stub/no_image"
 fleet recover up --force stub-runner
 rc=$?
@@ -200,6 +212,17 @@ if [[ "$rc" -eq 0 && "$(pulls)" -eq 1 ]] && grep -q 'verified: stub-runner' <<< 
   ok "refresh pulls IMAGE once, then replaces the runner"
 else
   no "refresh pulls IMAGE once, then replaces the runner (rc=$rc pulls=$(pulls)) $out"
+fi
+# The old upgrade was `up --force`; `refresh --force` is that muscle memory with the verb
+# swapped. --force is what refresh already means, so it is accepted, not read as a name.
+reset_stub
+fleet recover refresh --force stub-runner
+rc=$?
+out=$(cat "$TMP/up.out")
+if [[ "$rc" -eq 0 && "$(pulls)" -eq 1 ]] && grep -q 'verified: stub-runner' <<< "$out"; then
+  ok "refresh --force is refresh, not a runner named '--force'"
+else
+  no "refresh --force is refresh, not a runner named '--force' (rc=$rc pulls=$(pulls)) $out"
 fi
 reset_stub; touch "$TMP/stub/pull_fails"
 fleet recover refresh stub-runner
