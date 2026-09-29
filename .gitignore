@@ -4,3 +4,7 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# Claude.ai skill sync writes here through the ~/.claude/skills symlink; it owns this
+# tree, so git must not be a second writer. [LAW:one-source-of-truth]
+config/claude/skills/synced/
