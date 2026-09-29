@@ -31,6 +31,14 @@ guessing them would have been silent-wrong. That was never an argument against h
 against healing without a source of truth; `~/.config/runner-fleet/fleet.conf` is now that
 source, so a recreate reads the spec instead of guessing at it.
 
+A heal **restores; it never upgrades**. It runs `runner-fleet.sh up --force <name>`, which
+recreates from the runner image already on the host and never pulls, so a heal still works
+when the registry is unreachable or the disk is too full for a pull. Both earlier heal
+attempts died at exactly that pull. If the image is missing from the host, the heal fails
+and the log names the image; the operator fetches it with `runner-fleet.sh refresh`. Pulling
+a new runner version is always a deliberate `refresh` by an operator, never something the
+guard does.
+
 Healing is bounded to **one attempt per runner per 6h** (`RUNNER_GUARD_HEAL_COOLDOWN`). A
 recreate that does not address the cause — expired PAT, revoked repo access, a wedged VM —
 would otherwise be retried every cycle, 720 registration attempts a day against GitHub, which

@@ -20,8 +20,9 @@
 # EXIT CODES (a contract — each code a distinct outcome a caller can act on):
 #   0  the requested runners are in the desired state
 #   1  at least one runner could not be brought up (verified, not assumed)
-#   2  the script could not run: Docker unreachable, spec unreadable/invalid, or a
-#      required PAT file missing. Never conflated with "a runner is unhealthy".
+#   2  the script could not run: Docker unreachable, spec unreadable/invalid, a
+#      required PAT file missing, or the spec IMAGE not on this host (`up`) / not
+#      pullable (`refresh`). Never conflated with "a runner is unhealthy".
 #   3  `status` only: at least one runner is absent or broken (reporting, not failure)
 set -euo pipefail
 
@@ -72,13 +73,16 @@ usage() {
   cat >&2 <<'USAGE'
 usage:
   runner-fleet.sh status                    # classify every runner in the spec
-  runner-fleet.sh up [--force] [NAME...]    # converge runners to the spec (default: all)
+  runner-fleet.sh up [--force] [NAME...]    # restore runners to the spec (default: all)
+  runner-fleet.sh refresh [NAME...]         # pull IMAGE, then replace every selected runner
   runner-fleet.sh adopt [NAME...]           # recover a live container's PAT into its pat-file
   runner-fleet.sh plan [NAME...]            # print the docker run that `up` would issue
 
 `up` replaces a runner that is absent or broken and leaves a healthy one alone;
---force replaces it regardless. Replacing always pulls the spec's IMAGE first, so
-`up --force` is also how you take a new runner version (auto-update is off by design).
+--force replaces it regardless. `up` never touches the registry: it recreates from the
+copy of IMAGE already on this host, so it works with DNS down or the disk full. That is
+what runner-guard's heal runs. `refresh` is the only command that pulls, and it is how
+you take a new runner version (auto-update is off by design).
 USAGE
 }
 
@@ -192,17 +196,38 @@ require_docker() {
 }
 
 # --- create ---------------------------------------------------------------
+# Restoring a runner and upgrading it are different intents. They used to share one
+# path that always pulled, so every heal needed the registry AND free disk, and both
+# recorded heals died at exactly that pull (2026-09-06/07: Colima DNS could not resolve
+# the registry, CI down four days; 2026-09-28: /var/lib/docker out of inodes) while the
+# image they needed sat on the host the whole time. Now the pull is its own step,
+# taken only by `refresh`; everything else resolves the host's copy.
+# [LAW:types-are-the-program] (docs/adr/0001-ci-runner-resilience.md, decision 3)
+pull_image() {
+  log "refresh: pulling $IMAGE_SPEC from the registry"
+  docker pull "$IMAGE_SPEC" >/dev/null || die "docker pull $IMAGE_SPEC failed"
+}
+# up's fetch step: nothing to fetch, but say so. Docs elsewhere still call `up --force`
+# the upgrade; this line is where an operator following one learns it no longer is.
+keep_local_image() {
+  log "restore: using this host's copy of $IMAGE_SPEC, no registry pull (a new runner version is: $0 refresh)"
+}
+
 # Sets IMAGE_DIGEST rather than printing it. Returning it on stdout would put this
 # function's stdout on two duties at once — progress for a human and a value for the
 # caller — and log() writes to stdout, so `$(resolve_image)` captured the log line INTO
 # the image reference and handed docker a multi-line ref. One channel, one meaning.
 # (CLI binding: stdout vs stderr semantics are a design decision, not an accident.)
+#
+# Reads the image store only. An image that is not here is a loud stop naming it and
+# the command that fetches it, never a quiet pull: falling back to the registry would
+# put the heal back on the path that failed. [LAW:no-silent-failure]
 IMAGE_DIGEST=""
 resolve_image() {
-  log "pulling $IMAGE_SPEC to resolve an immutable digest"
-  docker pull "$IMAGE_SPEC" >/dev/null || die "docker pull $IMAGE_SPEC failed"
-  IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE_SPEC") \
-    || die "could not read RepoDigests for $IMAGE_SPEC"
+  local out
+  out=$(docker image inspect --format='{{index .RepoDigests 0}}' "$IMAGE_SPEC" 2>&1) \
+    || die "runner image $IMAGE_SPEC is not on this host ($(tr -s '[:space:]' ' ' <<< "$out" | sed 's/^ //; s/ $//')). up restores from the local image and never pulls; fetch it with: $0 refresh"
+  IMAGE_DIGEST="$out"
   # Validate the shape before it flows downstream. An external command's output is an
   # assertion about the world until something checks it; unchecked, a malformed value
   # surfaces as `docker: invalid reference format` one call later, with the actual
@@ -229,8 +254,11 @@ ensure_workdir() {
 render_run_flags() {
   local i="$1" wd
   wd="$(workdir_for "${R_NAME[$i]}")"
+  # --pull=never: the image was resolved to a digest already on this host, so docker
+  # must not reach for a registry at create time either. This is what makes "a heal
+  # never pulls" docker's guarantee rather than this script's habit. [LAW:single-enforcer]
   printf '%s\n' \
-    run -d --restart=always --name "${R_NAME[$i]}" \
+    run -d --pull=never --restart=always --name "${R_NAME[$i]}" \
     --network host \
     -e "REPO_URL=https://github.com/${R_REPO[$i]}" \
     -e "RUNNER_NAME=${R_RUNNER[$i]}" \
@@ -391,8 +419,11 @@ cmd_plan() {
   done
 }
 
+# `up` and `refresh` are one convergence. The only difference is FETCH, the step that
+# updates the host's copy of IMAGE before it is resolved: keep_local_image for up,
+# pull_image for refresh. [LAW:dataflow-not-control-flow]
 cmd_up() {
-  local force=0
+  local fetch="$1" force=0; shift
   # A ceiling that does not extend the wait recreates the false token failure, and
   # would do it after the container already exists: up exits 1, naming the wrong
   # cause. Refuse before any pull, stop, or create. [LAW:no-silent-failure]
@@ -404,6 +435,7 @@ cmd_up() {
   local i st image failed=0 acted=0 n=0
   # Resolve the image ONCE for the whole run, so every runner created by one invocation
   # is the same build — not whatever the registry served between two pulls.
+  "$fetch"
   resolve_image
   image="$IMAGE_DIGEST"
   log "image resolved: $image"
@@ -463,10 +495,12 @@ cmd_adopt() {
 main() {
   local cmd="${1:-}"; shift || true
   case "$cmd" in
-    status) parse_spec; require_docker; cmd_status "$@" ;;
-    up)     parse_spec; require_docker; cmd_up "$@" ;;
-    adopt)  parse_spec; require_docker; cmd_adopt "$@" ;;
-    plan)   parse_spec; cmd_plan "$@" ;;
+    status)  parse_spec; require_docker; cmd_status "$@" ;;
+    up)      parse_spec; require_docker; cmd_up keep_local_image "$@" ;;
+    # A refresh that left a healthy runner on the old image would not be a refresh.
+    refresh) parse_spec; require_docker; cmd_up pull_image --force "$@" ;;
+    adopt)   parse_spec; require_docker; cmd_adopt "$@" ;;
+    plan)    parse_spec; cmd_plan "$@" ;;
     ""|-h|--help|help) usage; exit 2 ;;
     *) echo "runner-fleet.sh: unknown command '$cmd'" >&2; usage; exit 2 ;;
   esac
