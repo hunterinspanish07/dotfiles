@@ -46,7 +46,10 @@ gaps above inside it:
    runner deaf.
 3. **A heal restores; it does not upgrade.** A heal recreates the runner from the
    runner image already on the host and needs no registry or free disk for a pull.
-   Pulling a new image stays an explicit refresh (`up --force` by an operator).
+   Pulling a new image stays an explicit refresh by an operator. (As built: `up`,
+   forced or not, restores and never pulls, and the new `runner-fleet.sh refresh`
+   is the only command that pulls. Manual recovery through `up` then works without
+   the registry too.)
    Restoring and upgrading are different intents and today share one code path. That
    path failed at the pull in both recorded heal attempts: on 2026-09-06/07 the
    registry lookup failed, and on 2026-09-28 the disk was full. Both times the image

@@ -104,6 +104,78 @@ PATH="$TMP/bin:$PATH" STUB="$TMP/stub" BANNERS="$TMP/banners" ALERTS_DIR="$TMP/a
 check "missing notifier: guard still completes its cycle (exit 0)" "$?" "0"
 if grep -q 'alert NOT raised' "$TMP/guard2.log"; then ok "missing notifier is logged as an unraised alert"; else no "missing notifier failed silently"; fi
 
+# --- the heal path, end to end ------------------------------------------------
+# The guard heals through the REAL runner-fleet. runner-fleet gets its own docker stub
+# on its own PATH (via a wrapper standing in for FLEET_SCRIPT), so the two tools' docker
+# calls cannot be confused. Both recorded heals (2026-09-06/07 DNS, 2026-09-28 inodes)
+# died at a registry pull while the runner image sat on the host; the pull here always
+# fails, so a heal that reaches for the registry cannot pass. [LAW:behavior-not-structure]
+FLEET="$DIR/../runner-fleet/runner-fleet.sh"
+mkdir -p "$TMP/fleetbin" "$TMP/fleetstub"
+printf '%s\n' token > "$TMP/pat"
+printf '%s\n' 'IMAGE=myoung34/github-runner:ubuntu-noble' "runner ht-runner owner/repo stub-name $TMP/pat" > "$TMP/fleet.conf"
+cat > "$TMP/fleetbin/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  info|stop|rm) exit 0 ;;
+  pull)  echo pull >> "$FSTUB/pulls"; echo "dial tcp: lookup registry-1.docker.io: no such host" >&2; exit 1 ;;
+  image) [[ -f "$FSTUB/no_image" ]] && { echo "Error response from daemon: No such image: ${*: -1}" >&2; exit 1; }
+         echo "myoung34/github-runner@sha256:deadbeef" ;;
+  run)   printf '%s\n' "$*" > "$FSTUB/run_args"; touch "$FSTUB/created" ;;
+  inspect)
+    case "$3" in
+      *RestartCount*)  [[ -f "$FSTUB/created" ]] && echo "running 0 0" || { echo "no such container" >&2; exit 1; } ;;
+      *RestartPolicy*) echo "exited 1 always" ;;
+      *)               echo "exited 1" ;;
+    esac ;;
+  logs)  echo "Listening for Jobs" ;;
+  *) echo "fleet stub docker: unexpected $*" >&2; exit 1 ;;
+esac
+EOF
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$TMP/fleetbin/colima"
+cat > "$TMP/fleet-wrapper" <<EOF
+#!/usr/bin/env bash
+PATH="$TMP/fleetbin:\$PATH" FSTUB="$TMP/fleetstub" RUNNER_FLEET_SPEC="$TMP/fleet.conf" \\
+  RUNNER_FLEET_LOG="$TMP/fleet.log" RUNNER_FLEET_SAMPLE=0 RUNNER_FLEET_POLL_SLEEP=0 \\
+  exec bash "$FLEET" "\$@"
+EOF
+chmod +x "$TMP/fleetbin/docker" "$TMP/fleetbin/colima" "$TMP/fleet-wrapper"
+heal_guard() {
+  rm -rf "$TMP/stub"/* "$TMP/fleetstub"/* "$TMP/heals" "$TMP/guard.log"
+  set_runner ht-runner "ht-runner exited 1 17 always"   # crash-looping at both samples
+  PATH="$TMP/bin:$PATH" STUB="$TMP/stub" BANNERS="$TMP/banners" \
+    ALERTS_DIR="$TMP/alerts" RUNNER_GUARD_ALERTS="$ALERTS_SH" \
+    RUNNER_GUARD_WINDOW=0 RUNNER_GUARD_LOG="$TMP/guard.log" \
+    RUNNER_FLEET_SCRIPT="$TMP/fleet-wrapper" RUNNER_GUARD_HEAL_STATE="$TMP/heals" \
+    /bin/bash "$GUARD" >/dev/null 2>&1
+}
+pull_count() { [[ -f "$TMP/fleetstub/pulls" ]] && wc -l < "$TMP/fleetstub/pulls" | tr -d ' ' || echo 0; }
+
+echo "== a heal restores from the host's image, with the registry unreachable =="
+heal_guard
+check "rogue healed: guard exit 1 (found and handled)" "$?" "1"
+if grep -q 'HEALED: ht-runner' "$TMP/guard.log"; then ok "the guard reports ht-runner healed"; else no "the guard did not heal ht-runner: $(tail -5 "$TMP/guard.log")"; fi
+if grep -q 'image resolved: myoung34/github-runner@sha256:deadbeef' "$TMP/guard.log"; then ok "the digest the heal used is in guard.log"; else no "the heal's digest is not in guard.log"; fi
+check "the heal made no registry pull" "$(pull_count)" "0"
+case "$(cat "$TMP/fleetstub/run_args" 2>/dev/null)" in
+  *--pull=never*myoung34/github-runner@sha256:deadbeef) ok "the replacement was created from that digest with --pull=never";;
+  *) no "the replacement was not created from the local digest with --pull=never ($(cat "$TMP/fleetstub/run_args" 2>/dev/null))";; esac
+
+echo "== a heal with no image on the host fails naming the image =="
+rm -rf "$TMP/fleetstub"/*; touch "$TMP/fleetstub/no_image"
+PATH="$TMP/bin:$PATH" STUB="$TMP/stub" BANNERS="$TMP/banners" ALERTS_DIR="$TMP/alerts" \
+  RUNNER_GUARD_ALERTS="$ALERTS_SH" RUNNER_GUARD_WINDOW=0 RUNNER_GUARD_LOG="$TMP/guard.log" \
+  RUNNER_FLEET_SCRIPT="$TMP/fleet-wrapper" RUNNER_GUARD_HEAL_STATE="$TMP/heals-absent" \
+  /bin/bash "$GUARD" >/dev/null 2>&1
+if grep -q 'heal FAILED for ht-runner' "$TMP/guard.log" && grep -q 'runner image myoung34/github-runner:ubuntu-noble is not on this host' "$TMP/guard.log"; then
+  ok "the failed heal names the missing image in guard.log"
+else
+  no "the failed heal does not name the missing image: $(grep -E 'FATAL|FAILED' "$TMP/guard.log" | tail -3)"
+fi
+if grep -q 'docker pull' "$TMP/guard.log"; then no "the absent-image heal reported a pull error"; else ok "no generic pull error stands in for the missing image"; fi
+check "the absent-image heal made no registry pull" "$(pull_count)" "0"
+if grep -q 'STOPPED: ht-runner' "$TMP/guard.log"; then ok "an unhealable rogue still falls through to the circuit-break"; else no "the unhealable rogue was not circuit-broken"; fi
+
 echo
 echo "$pass passed, $fail failed"
 [[ "$fail" -eq 0 ]]

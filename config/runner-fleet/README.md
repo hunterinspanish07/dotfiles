@@ -19,7 +19,8 @@ script redraws the territory from it.
 
 ```bash
 runner-fleet.sh status                  # classify every runner
-runner-fleet.sh up [--force] [NAME...]  # converge to the spec (default: all)
+runner-fleet.sh up [--force] [NAME...]  # restore to the spec from the local image (default: all)
+runner-fleet.sh refresh [NAME...]       # pull IMAGE, then replace every selected runner
 runner-fleet.sh plan [NAME...]          # print the docker run it would issue (no secrets)
 runner-fleet.sh adopt [NAME...]         # recover a live container's PAT into its pat-file
 ```
@@ -27,12 +28,29 @@ runner-fleet.sh adopt [NAME...]         # recover a live container's PAT into it
 `up` replaces a runner that is **absent**, **looping** or **parked**. It leaves **healthy**
 alone, and also leaves **settling** alone — that state means "unhealthy at one end of the
 sampling window only, no verdict yet", and tearing a runner down on an unconfirmed signal
-would discard the whole point of measuring twice. `--force` replaces regardless, which is
-also how you take a new runner version, since auto-update is off by design (below).
+would discard the whole point of measuring twice. `--force` replaces regardless.
+
+### Restore versus refresh
+
+Getting a runner back and upgrading it are two different jobs, and they have two commands:
+
+- **`up` restores.** It recreates from the copy of `IMAGE` already on this host and never
+  contacts a registry (containers are created with `--pull=never`). It works with Colima's
+  DNS down or `/var/lib/docker` full. runner-guard's heal runs `up --force <name>`. If the
+  image isn't on the host, `up` stops with exit 2, naming the image and telling you to run
+  `refresh`.
+- **`refresh` upgrades.** It pulls `IMAGE` from the registry, then replaces every selected
+  runner, healthy or not, so they all run the new build. It is the only command that pulls.
+
+They used to be one command, and every restore pulled first. Both recorded heals died at
+that pull while the image was sitting on the host: on 2026-09-06/07 Colima's DNS couldn't
+resolve the registry, and CI was down four days; on 2026-09-28 `/var/lib/docker` was out of
+inodes. See `docs/adr/0001-ci-runner-resilience.md`, decision 3.
 
 Exit codes: `0` in the desired state · `1` at least one runner could not be brought up
 (verified, not assumed) · `2` the script could not run (Docker unreachable, spec invalid,
-PAT missing) · `3` `status` only: something is absent or broken.
+PAT missing, image not on the host for `up`, pull failed for `refresh`) · `3` `status` only:
+something is absent or broken.
 
 ## What `up` guarantees
 
@@ -65,7 +83,7 @@ else touches it, and `plan` never renders it.
 ## Auto-update is off, deliberately
 
 Runners are created with `DISABLE_AUTO_UPDATE=true`, so `IMAGE` in `fleet.conf` is the only
-thing that moves the runner version. Refresh with `up --force`.
+thing that moves the runner version. Take a new version with `runner-fleet.sh refresh`.
 
 Left to itself the runner self-updates *in place*: it renames `/actions-runner/bin` to
 `bin.<version>`, unpacks the new release, and swaps it back. Interrupted, that leaves **no
@@ -82,7 +100,8 @@ installed. The image is the first. Keep one.
 
 `runner-guard` watches for crash-looping runners. It used to only stop them, because it owned
 none of the facts a recreate needs and guessing would have been silent-wrong. `fleet.conf` is
-now that source of truth, so the guard calls `up --force <name>` and verifies the result —
+now that source of truth, so the guard calls `up --force <name>` — a restore from the local
+image, never a pull — and verifies the result,
 bounded to one attempt per runner per 6h, so a bad credential can never become a retry loop.
 Measured end to end: a runner poisoned the way the real outage poisoned them was detected and
 back online in **two minutes**, unattended.

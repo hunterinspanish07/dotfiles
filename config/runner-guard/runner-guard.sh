@@ -127,7 +127,10 @@ heal_by_recreate() {
   # [LAW:no-ambient-temporal-coupling]
   : > "$marker" 2>/dev/null || true
 
-  log "  healing $name: recreating from the fleet spec"
+  # `up` restores from the runner image already on the host and never pulls; `refresh`
+  # is the only command that does. A heal must work when the registry is unreachable or
+  # the disk is full, which is exactly when the two recorded pulls failed.
+  log "  healing $name: recreating from the fleet spec and the local image"
   if "$FLEET_SCRIPT" up --force "$name" >>"$LOG_FILE" 2>&1; then
     return 0
   fi
